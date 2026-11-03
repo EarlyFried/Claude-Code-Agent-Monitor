@@ -3,14 +3,15 @@
  * updating of sessions with pagination plus status, search, and multi-directory
  * filtering. It computes costs, derives optional owner-aware task progress,
  * adds card-ready prompt context, reads Claude/Cursor/Codex conversations,
- * safely exposes transcript images, and broadcasts live changes.
+ * yields between task summaries, safely exposes transcript images, and broadcasts live changes.
  * @author Son Nguyen <hoangson091104@gmail.com>
  */
 
 const { Router } = require("express");
 const fs = require("fs");
 const path = require("path");
-const { stmts, db } = require("../db");
+const { setImmediate: yieldToEventLoop } = require("node:timers/promises");
+const { stmts, db, readRowsQuery, TASK_EVENTS_SQL } = require("../db");
 const { broadcast } = require("../websocket");
 const { calculateProviderCost, attachAgentCosts } = require("./pricing");
 const { parseSources, sourceColumnClause } = require("../lib/source-filter");
@@ -139,7 +140,7 @@ function sessionCcVersion(session) {
 }
 
 function taskEventsForSession(sessionId) {
-  return stmts.listTaskEventsBySession.all(sessionId);
+  return readRowsQuery(TASK_EVENTS_SQL, [sessionId]);
 }
 
 function taskProgressForSession(session, agents, events) {
@@ -156,8 +157,9 @@ function taskProgressForSession(session, agents, events) {
   });
 }
 
-function attachTaskSummaries(sessions) {
+async function attachTaskSummaries(sessions, res) {
   for (const [index, session] of sessions.entries()) {
+    if (res.destroyed) break;
     if (index >= MAX_TASK_PROGRESS_ROWS) continue;
     if (
       session.metadata &&
@@ -172,9 +174,13 @@ function attachTaskSummaries(sessions) {
       session.todo_summary = null;
       continue;
     }
+    const events = await taskEventsForSession(session.id);
+    if (res.destroyed) break;
     const agents = stmts.listAgentsBySession.all(session.id);
-    const events = taskEventsForSession(session.id);
     session.todo_summary = taskProgressForSession(session, agents, events).summary;
+    // A list can contain 100 summaries. Let completed worker reads and light
+    // HTTP requests run between sessions instead of blocking for the whole batch.
+    await yieldToEventLoop();
   }
   return sessions;
 }
@@ -273,7 +279,7 @@ async function readFirstLine(filePath) {
   return null;
 }
 
-router.get("/", (req, res) => {
+router.get("/", (req, res, next) => {
   const limit = Math.min(parseInt(req.query.limit) || 50, 10000);
   const offset = parseInt(req.query.offset) || 0;
   const status = req.query.status;
@@ -492,7 +498,14 @@ router.get("/", (req, res) => {
     rows = [...transient.map((session) => ({ ...session, has_token_usage: false })), ...rows];
   }
 
-  if (includeTaskProgress) attachTaskSummaries(rows);
+  if (includeTaskProgress) {
+    attachTaskSummaries(rows, res)
+      .then((sessions) => {
+        if (!res.destroyed) res.json({ sessions, limit, offset, total });
+      })
+      .catch(next);
+    return;
+  }
   res.json({ sessions: rows, limit, offset, total });
 });
 
