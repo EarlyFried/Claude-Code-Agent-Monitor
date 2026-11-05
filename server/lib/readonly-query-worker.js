@@ -10,10 +10,15 @@ const { parentPort, workerData } = require("node:worker_threads");
 const { performance } = require("node:perf_hooks");
 const scoped = require("./scoped-stats");
 
+// With driver "native" this must be the same better-sqlite3 the main thread
+// uses: a node:sqlite fallback would put a second SQLite library on the same
+// database in one process, whose locks the first cannot see — it then truncates
+// the shared `-shm` and crashes the main thread (SIGBUS). So "native" never
+// falls back; a load failure fails the read instead.
 let Database;
 try {
   if (workerData.driver === "compat") throw new Error("use compatibility driver");
-  Database = require("better-sqlite3");
+  Database = require(workerData.nativeModulePath || "better-sqlite3");
   new Database(":memory:").close();
 } catch (error) {
   if (workerData.driver === "native") throw error;

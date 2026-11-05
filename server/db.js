@@ -6,6 +6,12 @@
  */
 
 let Database;
+// Which SQLite library this process opened the database with. The read-only
+// worker (lib/readonly-query.js) must load the very same library: two SQLite
+// copies in one process do not see each other's POSIX locks, so the second one
+// believes it is the database's only user and truncates the `-shm` wal-index
+// the first still has memory-mapped — a SIGBUS crash.
+let sqliteDriver = { driver: "native", nativeModulePath: null };
 try {
   Database = require("better-sqlite3");
   // `require` only loads better-sqlite3's JS; its native addon is resolved
@@ -14,7 +20,11 @@ try {
   // for a different Node version — falls back to node:sqlite now, instead of
   // crashing later at the real `new Database(DB_PATH)` outside any try/catch.
   new Database(":memory:").close();
+  // Resolved here, on the main thread, so the desktop app's module redirect
+  // (which worker threads do not inherit) picks its Electron-ABI copy.
+  sqliteDriver.nativeModulePath = require.resolve("better-sqlite3");
 } catch {
+  sqliteDriver = { driver: "compat", nativeModulePath: null };
   try {
     Database = require("./compat-sqlite");
   } catch {
@@ -2755,7 +2765,7 @@ const stmts = {
 // Heavy HTTP counts use a lazy read-only worker. In-memory databases retain
 // their existing synchronous connection; a different worker cannot share them.
 const { ReadonlyQuery, databaseGeneration } = require("./lib/readonly-query");
-const queryReader = DB_PATH === ":memory:" ? null : new ReadonlyQuery(DB_PATH);
+const queryReader = DB_PATH === ":memory:" ? null : new ReadonlyQuery(DB_PATH, sqliteDriver);
 const closeDatabase = db.close.bind(db);
 db.close = () => {
   if (queryReader) queryReader.close();

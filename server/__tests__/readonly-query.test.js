@@ -559,3 +559,31 @@ for (const [driver, Constructor] of [
     }
   );
 }
+
+it(
+  "native: the worker loads the caller's better-sqlite3 path and never falls back to node:sqlite",
+  { skip: !Native, timeout: 30000 },
+  async () => {
+    // Two SQLite libraries in one process cannot see each other's POSIX locks:
+    // a node:sqlite reader would truncate the native connection's `-shm` and
+    // crash it (SIGBUS). The desktop app's worker cannot resolve a bare
+    // "better-sqlite3", so it must use the main thread's resolved path.
+    const { file, db } = fixture(Native, true);
+    const ok = new ReadonlyQuery(file, {
+      driver: "native",
+      nativeModulePath: require.resolve("better-sqlite3"),
+    });
+    const broken = new ReadonlyQuery(file, {
+      driver: "native",
+      nativeModulePath: path.join(root, "missing-better-sqlite3", "index.js"),
+    });
+    try {
+      assert.equal((await ok.read({ op: "get", sql: "SELECT 1 AS ready" })).ready, 1);
+      await assert.rejects(broken.read(query), /Cannot find module/);
+    } finally {
+      await ok.close();
+      await broken.close();
+      db.close();
+    }
+  }
+);

@@ -23,6 +23,11 @@ class ReadonlyQuery extends EventEmitter {
     dbPath,
     {
       driver = "auto",
+      // Absolute path of the better-sqlite3 entry the caller's own connection
+      // uses. Worker threads resolve modules without the desktop app's
+      // main-thread redirect, so a bare require could miss (or pick another
+      // copy) and fall back to a second SQLite library in the same process.
+      nativeModulePath = null,
       timeoutMs = 30000,
       maxPending = 64,
       eventPageBudgetBytes = EVENT_PAGE_BUDGET_BYTES,
@@ -32,6 +37,7 @@ class ReadonlyQuery extends EventEmitter {
     super();
     this.dbPath = path.resolve(dbPath);
     this.driver = driver;
+    this.nativeModulePath = nativeModulePath;
     this.timeoutMs = timeoutMs;
     this.maxPending = maxPending;
     this.eventPageBudgetBytes = eventPageBudgetBytes;
@@ -141,6 +147,7 @@ class ReadonlyQuery extends EventEmitter {
       workerData: {
         dbPath: this.dbPath,
         driver: this.driver,
+        nativeModulePath: this.nativeModulePath,
         eventPageBudgetBytes: this.eventPageBudgetBytes,
       },
       resourceLimits: { maxOldGenerationSizeMb: WORKER_HEAP_MB },
