@@ -57,6 +57,18 @@ const SESSION_LAST_ACTIVITY_SQL = `COALESCE(
   s.started_at
 )`;
 
+// Total tokens a session has consumed: every token bucket (input, output, cache
+// read, cache write) summed across models, including pre-reconciliation
+// baselines. `cache_write_1h_tokens` is a priced subset of cache writes, so it
+// is not added again. Sessions without token_usage rows report 0.
+const SESSION_TOTAL_TOKENS_SQL = `(
+  SELECT COALESCE(SUM(
+    tu.input_tokens + tu.output_tokens + tu.cache_read_tokens + tu.cache_write_tokens +
+    tu.baseline_input + tu.baseline_output + tu.baseline_cache_read + tu.baseline_cache_write
+  ), 0)
+  FROM token_usage tu WHERE tu.session_id = s.id
+)`;
+
 // Compact cards need enough context to distinguish a meaningful task from a
 // renamed session title. Both providers preserve their newest two distinct
 // human turns as a tiny newline-separated summary. Claude derives it from its
@@ -110,6 +122,21 @@ function sessionIsInScope(session, req) {
     (!sources || sources.includes(session.source || "local")) &&
     (!providers || providers.includes(session.provider || "claude"))
   );
+}
+
+/**
+ * The Claude Code version a session recorded (`metadata.version`), which prices
+ * version-gated intro rates for token rows not split by version; null when
+ * absent or the metadata is not JSON.
+ */
+function sessionCcVersion(session) {
+  if (!session || !session.metadata) return null;
+  try {
+    const version = JSON.parse(session.metadata).version;
+    return typeof version === "string" ? version : null;
+  } catch {
+    return null;
+  }
 }
 
 function taskEventsForSession(sessionId) {
@@ -266,7 +293,7 @@ router.get("/", (req, res, next) => {
     : typeof req.query.cwd === "string" && req.query.cwd
       ? [req.query.cwd]
       : [];
-  const sortBy = req.query.sort_by || "time"; // "time", "duration", "price"
+  const sortBy = req.query.sort_by || "time"; // "time", "duration", "price", "tokens"
   const sortDesc = req.query.sort_desc !== "false";
   const sources = parseSources(req);
   const providers = parseProviders(req);
@@ -309,6 +336,7 @@ router.get("/", (req, res, next) => {
     const allRows = db
       .prepare(
         `SELECT s.*, COUNT(a.id) as agent_count, ${SESSION_LAST_ACTIVITY_SQL} as last_activity,
+                ${SESSION_TOTAL_TOKENS_SQL} as total_tokens,
                 ${SESSION_PROMPT_PREVIEW_SQL} AS prompt_preview
          FROM sessions s LEFT JOIN agents a ON a.session_id = s.id
          ${whereSql}
@@ -327,7 +355,7 @@ router.get("/", (req, res, next) => {
         const placeholders = ids.map(() => "?").join(",");
         const chunkTokens = db
           .prepare(
-            `SELECT session_id, model, speed, inference_geo, service_tier, context_size,
+            `SELECT session_id, model, speed, inference_geo, service_tier, context_size, cc_version,
               input_tokens + baseline_input as input_tokens,
               output_tokens + baseline_output as output_tokens,
               cache_read_tokens + baseline_cache_read as cache_read_tokens,
@@ -341,12 +369,16 @@ router.get("/", (req, res, next) => {
           .all(...ids);
 
         const providerBySession = new Map(chunk.map((session) => [session.id, session.provider]));
+        const versionBySession = new Map(
+          chunk.map((session) => [session.id, sessionCcVersion(session)])
+        );
         const tokensBySession = {};
         for (const t of chunkTokens) {
           if (!tokensBySession[t.session_id]) tokensBySession[t.session_id] = [];
           tokensBySession[t.session_id].push({
             ...t,
             provider: providerBySession.get(t.session_id) || "claude",
+            cc_version: t.cc_version || versionBySession.get(t.session_id),
           });
         }
 
@@ -371,11 +403,14 @@ router.get("/", (req, res, next) => {
       orderSql = `last_activity ${sortDesc ? "DESC" : "ASC"}`;
     } else if (sortBy === "duration") {
       orderSql = `(julianday(COALESCE(s.ended_at, strftime('%Y-%m-%dT%H:%M:%fZ', 'now'))) - julianday(s.started_at)) ${sortDesc ? "DESC" : "ASC"}`;
+    } else if (sortBy === "tokens") {
+      orderSql = `total_tokens ${sortDesc ? "DESC" : "ASC"}, last_activity DESC`;
     }
 
     rows = db
       .prepare(
         `SELECT s.*, COUNT(a.id) as agent_count, ${SESSION_LAST_ACTIVITY_SQL} as last_activity,
+                ${SESSION_TOTAL_TOKENS_SQL} as total_tokens,
                 ${SESSION_PROMPT_PREVIEW_SQL} AS prompt_preview
          FROM sessions s LEFT JOIN agents a ON a.session_id = s.id
          ${whereSql}
@@ -388,7 +423,7 @@ router.get("/", (req, res, next) => {
       const placeholders = ids.map(() => "?").join(",");
       const allTokens = db
         .prepare(
-          `SELECT session_id, model, speed, inference_geo, service_tier, context_size,
+          `SELECT session_id, model, speed, inference_geo, service_tier, context_size, cc_version,
             input_tokens + baseline_input as input_tokens,
             output_tokens + baseline_output as output_tokens,
             cache_read_tokens + baseline_cache_read as cache_read_tokens,
@@ -405,12 +440,16 @@ router.get("/", (req, res, next) => {
       const gptRules = stmts.listGptPricing.all();
       const cursorRules = stmts.listCursorPricing.all();
       const providerBySession = new Map(rows.map((session) => [session.id, session.provider]));
+      const versionBySession = new Map(
+        rows.map((session) => [session.id, sessionCcVersion(session)])
+      );
       const tokensBySession = {};
       for (const t of allTokens) {
         if (!tokensBySession[t.session_id]) tokensBySession[t.session_id] = [];
         tokensBySession[t.session_id].push({
           ...t,
           provider: providerBySession.get(t.session_id) || "claude",
+          cc_version: t.cc_version || versionBySession.get(t.session_id),
         });
       }
 

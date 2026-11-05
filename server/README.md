@@ -573,6 +573,9 @@ Request body:
 
 `provider` must be one of `claude`/`codex`. `tokens[]` entries are each
 bucket's **full current total** (like a transcript re-parse), not a delta.
+An entry may add `context_size` (`"short"` default, or `"long"` for a
+long-prompt-tier model's over-limit requests); pushers that omit it land in the
+short bucket.
 `repo_remote_url` is optional collector-supplied metadata. URL/SCP userinfo, query
 strings, and fragments are removed; malformed URL-style values are discarded.
 The first non-empty sanitized value is retained, even when it arrives after
@@ -843,6 +846,7 @@ rewrites `parent_agent_id`) and runs in `importSession` and the live
 | `server/lib/snapshot-retention.js` | Snapshot policy: background compression of snapshots whose original is gone, opt-in age/size caps, dry-run prune planning, purge-time deletion |
 | `server/lib/archive.js`        | Safe archive extractors (`.zip` / `.tar(.gz)` / `.gz`) with path-traversal and size-cap enforcement    |
 | `scripts/import-history.js`    | Generalized directory walker (`importFromDirectory`) + shared `parseSessionFile` / `importSession`. Re-import is fully incremental: per-event-type high-water mark (`MAX(created_at) GROUP BY event_type` per session) drives `ts > cutoff[type]` dedup for Stop / PostToolUse / TurnDuration / ToolError, and `sessions.ended_at` is rolled forward when the JSONL has progressed past the stored value. After each batch imports, it calls `ingestWorkflowsForSession` (`server/lib/workflow-ingest.js`) per session — outside the SQLite transaction — so an offline/headless/CI/cluster **Workflow-tool** run (whose journal never reached a live server) has its inner agents linked to their `run_id` on a plain rescan / path import, not left orphaned (`workflow_run_id = NULL`). Both parsers reconcile usage per `message.id` (last record wins), matching `transcript-cache.js`, and combine the main transcript with flat subagent transcripts by model; nested Workflow-tool agents remain separate. `reconcileTokens(dbModule, {all, resetBaselines})` backs `npm run repair-tokens` — the one-time repair that re-derives totals for every **Claude** session with a transcript on disk (located under `~/.claude/projects/` or via the session's stored `transcript_path`) and zeroes the `baseline_*` columns, which the ordinary high-water fold would otherwise use to preserve an incorrect historical total. It clears only non-workflow rows, excludes Codex sessions (their usage comes from rollout journals, not Claude transcripts), and refuses to run while a dashboard is up |
+| `server/lib/cost-state.js` | Top-up of token totals to Claude Code's own `cost-state` transcript entry (per-model running totals), which includes the `/compact` request and WebFetch secondary-model calls that never become assistant messages. `applyCostState` runs after the live `replaceTokenUsage` writes (`routes/hooks.js`; also on watchdog ticks and the liveness reap, for a record no hook followed) and after every `reconcileTokens`/`importSession` write (`scripts/import-history.js`); it only raises totals — into `baseline_*` via `stmts.addTokenUsageBaseline` — per Claude Code version when the record sequence shows which version each increase came from (`trackCostState`), and split between a long-prompt-tier model's short and long buckets by Claude's `costUSD` for the model (`splitByPromptSize`), ignores a record stamped with another session id, and matches Bedrock/Vertex/`[1m]`/dated model spellings to one model. `reconcileTokens(dbModule, {costStateOnly: true})` is the transcript-row-preserving form used by the one-time startup backfill |
 | `server/lib/transcript-cache.js` | Chunked 4 MiB sync byte-stream reader for JSONL transcripts — never materializes the whole file as a JS string, so files larger than V8's max string length (~512 MiB on 64-bit Node 20) parse without aborting Node with `FATAL ERROR: v8::ToLocalChecked Empty MaybeLocal`. Token usage is **reconciled per `message.id`** (last record wins), not summed per record: Claude Code writes one record per content block and each copies the message's `usage`, so the old per-record sum inflated totals 2–4× (issue #293) |
 
 **Request flow (upload)**
@@ -890,7 +894,7 @@ matches one probed from either layout candidate.
 | Variable                          | Default     | Purpose                                                           |
 | --------------------------------- | ----------- | ----------------------------------------------------------------- |
 | `CCAM_IMPORT_MAX_BYTES`           | `1073741824` | Maximum size per uploaded file                                   |
-| `DASHBOARD_TOKEN_REPAIR`          | `1`         | One-time automatic repair of historical token totals affected by per-record inflation or omitted same-model flat subagents; `0` skips it (repair manually with `npm run repair-tokens`) |
+| `DASHBOARD_TOKEN_REPAIR`          | `1`         | One-time automatic repair of historical token totals affected by per-record inflation or omitted same-model flat subagents, plus the follow-up top-up to Claude's own saved `cost-state` usage (`/compact` and WebFetch calls with no transcript message); `0` skips them (repair manually with `npm run repair-tokens`) |
 | `CCAM_IMPORT_MAX_FILES`           | `2000`      | Maximum files per upload request                                 |
 | `CCAM_IMPORT_MAX_EXTRACT_BYTES`   | `4294967296` | Total uncompressed bytes allowed per archive (zip-bomb guard)   |
 
@@ -1154,10 +1158,39 @@ const DEFAULT_PRICING = [
   ["claude-mythos-5%", "Claude Mythos 5", 10, 50, 1, 12.5, 20],
   ["claude-opus-4-8%", "Claude Opus 4.8", 5, 25, 0.5, 6.25, 10],
   ["claude-sonnet-4-6%", "Claude Sonnet 4.6", 3, 15, 0.3, 3.75, 6],
+  ["claude-haiku-5-5%", "Claude Haiku 5.5", 0.1, 0.5, 0.01, 0.125, 0.2],
   ["claude-haiku-4-5%", "Claude Haiku 4.5", 1, 5, 0.1, 1.25, 2],
+  // Bedrock id (anthropic.claude-haiku-4-5-20251001-v1:0), billed at the first-party card
+  ["anthropic.claude-haiku-4-5%", "Claude Haiku 4.5 (Bedrock)", 1, 5, 0.1, 1.25, 2],
   // ... one explicit row per model (see server/db.js for the full list)
 ];
 ```
+
+Patterns match the whole model string, so a provider-prefixed id (Bedrock's
+`anthropic.…`) needs its own row; without one its usage prices at $0 and is
+listed in `unpriced_models`.
+
+Intro rates are seeded separately (`DEFAULT_INTRO_PRICING` in `db.js`, applied at
+startup and by reset-pricing, only onto rows whose `intro_until` is still NULL):
+usage on or before `intro_until` bills the `intro_*` rates, and an intro rate of 0
+keeps the standard rate for that field. A rule may also carry
+`intro_until_version`: when the Claude Code version that made the requests is
+known, usage from that version or older bills the intro rates instead of
+deciding by date, and the date stays the fallback. Token rows record that
+version per request (`token_usage.cc_version`, from each transcript entry's
+`version`), so a session resumed across releases prices each message by its own
+version; rows without one use the session's recorded version
+(`sessions.metadata.version`, the first `version` in its transcript). Sonnet 5.5
+uses this to match Claude Code's own cost figure: cache reads at $0.20 through
+Claude Code 2.1.295, $0.10 from 2.1.296 (date fallback: through 2026-10-06).
+
+Long-prompt tiers are seeded separately (`DEFAULT_LONG_PRICING` in `db.js`, applied
+at startup and by reset-pricing): Haiku 5.5 bills prompts over 100K tokens at
+$0.50/$2.50 (`long_input_per_mtok` / `long_output_per_mtok`, cache rates scaled
+with the input base). The parsers stamp each request `context_size = 'long'`
+when its prompt (input + cache reads + cache writes) exceeds the limit in
+`CLAUDE_LONG_CONTEXT_TIERS` (`server/lib/pricing-constants.js`); only models
+listed there are ever split.
 
 ---
 

@@ -390,6 +390,7 @@ graph TD
 | `scripts/import-history.js` | Batch history importer used by (a) server startup auto-import, (b) the `/api/import/*` routes, (c) the `import-history` CLI, and (d) live `SubagentStop` ingestion via the exported `scanAndImportSubagents(dbModule, sessionId, transcriptPath)`. Exposes `importAllSessions(dbModule)` for the default `~/.claude/projects` tree, `syncDefaultProjects(dbModule, {mtimeCache})` (the incremental, mtime-fingerprinted re-sweep that backs the continuous background sync — parses only new/changed files and reports `[{sessionId, isNew}]`), and the generalized `importFromDirectory(dbModule, rootDir, {onProgress})` which walks any directory recursively, classifies each `.jsonl` as session vs subagent (with `findSessionSubagents` probing both `<proj>/<sid>/subagents/*` and `<proj>/subagents/<sid>/*` layouts), and funnels everything through the shared `parseSessionFile` + `importSession` pipeline. The durable transcript snapshot (`snapshotTranscript`) additionally preserves **nested** Workflow-tool inner-agent transcripts (`subagents/workflows/<runId>/agent-*.jsonl`) via the separate `findSessionWorkflowSubagents` probe — mirroring the run subpath so the read route resolves the snapshot identically to the live file, without pulling those nested agents into the flat sub-agent import (no double-count). After each batch imports, `importAllSessions` / `importFromDirectory` also call `ingestWorkflowsForSession` (from `server/lib/workflow-ingest.js`) per session — outside the SQLite transaction, since the ingest is async — so a **Workflow-tool** run whose journal never reached a live server (a headless `claude -p` run, a CI job, or an HPC/cluster node emits no hooks) still links its inner agents to their `run_id` on a plain `ccam import rescan` / `ccam import path`, instead of leaving them orphaned (`workflow_run_id = NULL`) with the run stuck at 1 agent — see "Workflow-Tool Run Ingestion". `parseSubagentFile` extracts ordered `toolEvents` (tool_use + tool_result paired by `tool_use_id`) so `importSubagentFromJsonl` can emit per-tool `PreToolUse` + `PostToolUse` rows under each subagent's own `agent_id`. The importer dedups against live hook-created subagent rows via `findLiveSubagentForJsonl` (session + subagent_type + start-time within 30 s) so backfill never produces parallel `<sid>-jsonl-*` rows. It also **skips `importSubagents` entirely when subagent transcripts exist** — the main-transcript `Agent`-block rows (`<sid>-subagent-N`) and the transcript rows (`<sid>-jsonl-*`) would otherwise both be created and only deduped by a fragile type+timing match, doubling every subagent; when transcripts are present the richer `-jsonl-` rows are authoritative and the `-subagent-N` fallback runs only when there are none. `importSession` now also **persists `transcript_path`** on the session row (via `setSessionTranscriptPath`) so the abandon sweep, compaction scanner, and per-agent cost backfill can locate the transcript later, and **stamps each subagent's own token buckets into `metadata.tokens`** (used for per-agent cost). `backfillSubagentTokenMetadata` (a deferred, self-limiting startup pass) fills `metadata.tokens` on subagents that predate per-agent cost, deriving the transcript path from `<projectsDir>/<slug>/<sid>.jsonl` when `transcript_path` is null and covering both subagent-dir layouts — metadata-only, so it never touches session `token_usage`. `classifyJsonl` treats any file under a `subagents/` ancestor at any depth (including the `subagents/workflows/<runId>/` tree) as a subagent, so workflow inner-agent transcripts are never misimported as top-level sessions. **Nested-subagent hierarchy** is rebuilt by `reconcileSubagentParents`: every subagent is inserted flat under the main agent (no single hook/JSONL carries the spawner id), then `parseSubagentFile` also returns `spawnedChildren` — the child agent ids named on each Task tool result (`toolUseResult.agentId`) — which are inverted to a child→parent map and used to repoint `parent_agent_id` (via the `setAgentParent` statement) so a subagent that spawns its own subagents nests under its true spawner instead of collapsing flat under main; any subagent no other subagent claims stays under main. It resolves both the child and parent to their live-or-jsonl DB id (mirroring `importSubagentFromJsonl`), so it also corrects the live hook heuristic's guesses once the transcripts land. Idempotent and additive (only rewrites `parent_agent_id`), it runs in all three group-import paths (`importSession` ×2, live `scanAndImportSubagents`); `scanAndImportSubagents` returns a `reparented` count alongside `created`. **Re-import is fully incremental**: for each existing session a per-event-type high-water mark (`MAX(created_at) GROUP BY event_type`) is read up-front and only JSONL entries with `ts > cutoff[type]` are inserted for Stop / PostToolUse / TurnDuration / ToolError — so long-running sessions whose transcripts grow across multiple days continue to receive new events on every re-run instead of being blocked by the old "if zero of type X then dump all" check. `sessions.ended_at` is rolled forward to the JSONL's last activity when it surpasses the stored value, and `metadata.user_messages` / `assistant_messages` / `turn_count` are refreshed on every pass. `parseSessionFile` also captures the transcript title (`custom-title` / `ai-title`) and `importSession` prefers it for `sessions.name` over the cwd-folder fallback, backfilling existing auto/placeholder names on re-import (same precedence as the live hook sync). Other idempotency keys are unchanged: `data LIKE '%"tool_use_id":"X"%'` skips any tool event already inserted, compaction agents/events dedup by uuid, API errors dedup by summary, and `baseline_*` columns preserve pre-compaction token totals. `parseSessionFile` and `parseSubagentFile` **reconcile usage per `message.id`** (last record wins, via the shared `rememberUsageContribution` / `subtractBucket` helpers in `server/lib/token-usage.js`) exactly as the live `TranscriptCache` does — see "Per-message usage reconciliation". `reconcileTokens(dbModule, {all, resetBaselines})` is the historical repair sweep behind `npm run repair-tokens`: `--all` covers every session with a transcript on disk rather than only `imported`-marked ones, and `--reset-baselines` clears each session's non-workflow `token_usage` rows and writes fresh totals with zeroed baselines (`resetTokenUsage`), since the ordinary high-water fold would otherwise migrate a historical over-count into `baseline_*` instead of removing it. It refuses to run while a dashboard answers on a known port (transcripts are parsed outside the write transaction, so live ingestion would race it) and rejects `--dry-run` rather than ignoring it. Token totals, per-model cost, compactions, subagents, tool events, API errors, and turn durations are identical to live ingestion. Creates `APIError`, `TurnDuration`, and `ToolError` event types during import; subagent tool events carry `imported: true, source: "subagent_jsonl"` in their data payload so analytics can distinguish backfilled rows when needed |
 | `scripts/cost-snapshot.js` | Opens the effective dashboard database read-only and writes a private per-session TSV for upgrade comparisons. Run `node scripts/cost-snapshot.js snapshot --out before.tsv`, upgrade and restart CCAM, let startup maintenance finish, then write `after.tsv` and run `node scripts/cost-snapshot.js compare before.tsv after.tsv --fail-on-local-change`. The guard fails for changes to the compared usage/cost fields, ownership moving to or from local, or a removed local session; remote and newly added sessions are reported separately. |
 | `server/routes/import.js`   | Provider-aware Import History router. `provider: "claude"\|"codex"` selects the Claude JSONL importer or Codex rollout importer for `GET /api/import/guide`, default rescans, arbitrary paths, and multipart uploads. External Codex rollouts are snapshotted before temp extraction is reclaimed, while default scans retain their live path; all progress frames include the provider. Limits remain configurable via `CCAM_IMPORT_MAX_BYTES` / `CCAM_IMPORT_MAX_FILES`. |
+| `server/lib/cost-state.js` | Reconciles a session's token totals with the `cost-state` entry Claude Code appends to the transcript on save (its own per-model running totals). Covers API calls billed but never written as an assistant message — the `/compact` summary request and WebFetch's secondary-model calls. `parseCostStateEntry` reads the entry (captured by `transcript-cache.js` and the importer); `applyCostState` raises each model's effective total (`live + baseline`, all buckets) up to Claude's figure through `stmts.addTokenUsageBaseline`. Raise-only, session-id-guarded, and model-name-normalised (Bedrock/Vertex/`[1m]`/dated spellings) so it can neither lower a total nor count a model twice. `trackCostState` splits Claude's running totals by the Claude Code version that ran when each increase was saved, so each version's rows are topped up to that version's own figure (unversioned `''` usage those top-ups now cover moves onto them). `routes/hooks.js` re-reads the transcript 2 s and 15 s after SessionEnd to apply a record Claude writes as it exits, and the watchdog tick and liveness reap apply a record that no hook followed (session ended without SessionEnd, or continued in a new session). |
 | `server/lib/codex-import.js` | Historical Codex rollout facade over `codex-ingest.js`: recursively discovers rollouts, preserves native titles from `session_index.jsonl`, keeps byte cursors idempotent, and stores external/imported transcripts under the dashboard data directory for durable conversation access. |
 | `server/lib/data-transfer.js` | Full-dataset export/import ("backup / restore"). `buildExportBundle(db, stmts)` serializes every user-owned table (sessions, agents, events, token_usage, workflows, dashboard_runs, alert_rules, model_pricing, cursor_model_pricing, gpt_model_pricing) into one versioned JSON bundle (`format: "ccam-export"`); machine-bound/secret tables (push_subscriptions, webhook_targets/deliveries, alert_events, local Codex/Cursor ingest cursors) are excluded. `importExportBundle(db, bundle)` restores it session-atomically inside one transaction with `defer_foreign_keys` ON: a session already present (by UUID) is skipped WHOLE (with its agents/events/token_usage/workflows) so re-import and cross-machine merges never duplicate or clobber; events are re-inserted without their non-portable autoincrement id; config rows use `INSERT OR IGNORE` on their natural key. Backs `GET/POST /api/settings/{export,import}` and `ccam import-data` |
 | `server/lib/archive.js`     | Safe archive extraction: `.zip` via `adm-zip`, `.tar`/`.tar.gz`/`.tgz` via `tar`, plain `.gz` via `zlib` in streaming mode. Every entry is validated through `safeJoin` which rejects absolute paths and `..` traversal before any bytes are written. Enforces a hard extraction cap (`MAX_EXTRACT_BYTES`, default 4 GB, tunable via `CCAM_IMPORT_MAX_EXTRACT_BYTES`) with `ExtractionLimitError` surfaced as HTTP 413 from the upload route — defense against zip/tar/gzip bombs. Also provides `detectKind` for filename-based dispatch and `mkTempDir`/`rmTempDir` helpers |
@@ -484,7 +485,7 @@ flowchart LR
 graph TD
     APP["App.tsx<br/>Router + WebSocket"]
     LAYOUT["Layout.tsx<br/>Sidebar + Outlet"]
-    SIDEBAR["Sidebar.tsx<br/>Nav (scroll-bounded with overflow<br/>chevrons) + Connection Status"]
+    SIDEBAR["Sidebar.tsx<br/>Nav (scroll-bounded with overflow<br/>chevrons) + Refresh page +<br/>Connection Status"]
     PALETTE["CommandPalette.tsx<br/>Cmd/Ctrl+K launcher: recent, pages,<br/>sessions, views, settings, config, actions"]
     SHORTCUTS["PaletteActionProvider.tsx<br/>Registry of the actions the<br/>mounted page offers the palette"]
     TOAST["ActionToast.tsx<br/>Confirms actions that<br/>change state without navigating"]
@@ -516,7 +517,7 @@ graph TD
     COL --> AC2["AgentCard[]"]
 
     SESS --> TABLE["Session Table<br/>with filters"]
-    DETAIL --> OVERVIEW["SessionOverview<br/>(stat tiles, top tools,<br/>subagent breakdown,<br/>token flow, event mix)"]
+    DETAIL --> OVERVIEW["SessionOverview<br/>(stat tiles, top tools,<br/>subagent breakdown,<br/>token flow + token cost, event mix)"]
     DETAIL --> AC3["AgentCard hierarchy<br/>parent → children tree"]
     DETAIL --> CONV["ConversationView<br/>(MarkdownContent + CodeBlock<br/>+ ToolCallBlock per-tool styling)"]
     DETAIL --> TL["Event Timeline"]
@@ -978,6 +979,8 @@ erDiagram
         TEXT speed PK "standard or fast (fast mode) — pricing dimension"
         TEXT inference_geo PK "global or us (data residency) — pricing dimension"
         TEXT service_tier PK "standard or batch (Batch API) — pricing dimension"
+        TEXT context_size PK "short or long (long-prompt tier) — pricing dimension"
+        TEXT cc_version PK "Claude Code version that made the requests; '' = not split — pricing dimension"
         INTEGER input_tokens "Current JSONL total"
         INTEGER output_tokens "Current JSONL total"
         INTEGER cache_read_tokens "Current JSONL total"
@@ -1526,6 +1529,87 @@ disabled entirely by `DASHBOARD_TOKEN_REPAIR=0`. Because the sweep clears and
 rewrites rows, it first copies the table to `token_usage_pre_repair_v2` — one
 snapshot kept so the pre-repair numbers stay recoverable with plain SQL; it is
 safe to drop.
+
+A second, narrower one-time pass (`repairLongContextTokenTotals`, marker
+`.token-repair-long-context-v1.done`, same guards and `DASHBOARD_TOKEN_REPAIR=0`
+opt-out, waits for the v2 marker) handles the long-prompt rate tier. Models with
+a tier in `CLAUDE_LONG_CONTEXT_TIERS` (today Claude Haiku 5.5, over 100K prompt
+tokens) now keep short and long requests in separate `token_usage` rows
+(`context_size`), but rows stored earlier mix both and cannot be split after the
+fact. Re-deriving only the sessions that already hold such a model's usage, with
+baselines reset, avoids the high-water mark folding the old total into
+`baseline_*` and counting the long tokens twice; the old rows are kept in
+`token_usage_pre_long_context_v1`.
+
+A third pass (`repairCostStateTokenTotals`, marker
+`.token-repair-cost-state-v1.done`, same guards and opt-out, waits for both
+markers above) backfills sessions recorded before the live path applied
+Claude's own `cost-state` totals. Transcript messages omit API calls Claude Code
+still bills — the `/compact` summary request and WebFetch's secondary-model
+(Haiku) calls — so a transcript-only total ran below Claude's (on one real
+database, the sessions with a `cost-state` summed to $1,081 against Claude's
+$1,881). The sweep is `reconcileTokens(..., { costStateOnly: true })`: it leaves
+every transcript-derived row untouched and only raises a model's totals,
+through `baseline_*`, to Claude's figure. It is additive and safe to re-run;
+the pre-backfill rows are kept in `token_usage_pre_cost_state_v1`.
+
+A fourth pass (`repairCostStateTokenTotalsV2`, marker
+`.token-repair-cost-state-v2.done`, same guards, waits for the v1 marker) heals
+two gaps the third left. A bucket seen only through `cost-state` (no recorded
+cache writes, every baseline write 5m) is re-split to the session's recorded 1h
+share, matching how the top-up now prices such a model. Then the raise-only
+sweep runs once more for records Claude appended after the SessionEnd hook had
+read the transcript. The pre-repair rows are kept in
+`token_usage_pre_cost_state_v2`.
+
+At startup, `backfillSessionVersions` (`scripts/import-history.js`) also stamps
+`metadata.version` onto live-recorded Claude sessions that predate version
+capture, so pricing rules with an `intro_until_version` cutoff can price them by
+Claude Code version. It is metadata-only and looks at each session once.
+
+A fifth pass (`repairCcVersionTokenSplit`, marker
+`.token-repair-cc-version-v2.done`, same guards, waits for the cost-state v2
+marker) splits token rows by Claude Code version. `token_usage.cc_version`
+records the version of the process that made each request (the transcript
+entry's own `version`), so a session resumed across a release that repriced a
+rate bills each message by the version that made it (Sonnet 5.5's cache read
+dropped from $0.20 to $0.10 at 2.1.296). Rows stored before the column existed
+hold every version under `''` and price by the session's `metadata.version`.
+The pass re-reads those sessions through `writeTokenBuckets`
+(`server/lib/token-usage.js`), which keeps the high-water mark per bucket: each
+version row keeps the larger of its stored and newly read usage, the bucket
+total never shrinks, and whatever the version rows don't cover stays on the
+`''` row. Claude's `cost-state` records are then applied per version:
+`trackCostState` (`server/lib/cost-state.js`) gives each increase between two
+consecutive records to the version running when the later one was written, and
+`applyCostState` raises each version row to that figure, taking the amount out
+of the `''` row. Sessions the v1 pass already split across versions are re-read
+with baselines reset so the old usage-share estimate is replaced by the exact
+split. The pre-pass rows are kept in `token_usage_pre_cc_version_v2`. Live
+writers fold an unsplit row into versioned rows the same way, so nothing is
+counted twice even before the pass runs. After this migration the database
+needs a build that knows the `cc_version` key; an older build cannot write
+token rows to it.
+
+A sixth pass (`repairLongTierCostSplit`, marker
+`.token-repair-long-tier-cost-v1.done`, same guards, waits for the cc-version
+v2 marker) re-reads sessions whose long-prompt-tier model (Claude Haiku 5.5)
+has usage beyond its transcript, with baselines reset. Claude's `cost-state`
+totals carry no prompt sizes, so earlier builds put that usage on the model's
+largest bucket (usually long) and billed small calls such as WebFetch page
+summaries at long rates. `applyCostState` now splits it by Claude's own cost
+for the model (`splitByPromptSize` in `server/lib/cost-state.js`). The
+pre-repair rows are kept in `token_usage_pre_long_tier_cost_v1`.
+
+A seventh pass (`repairForkCopiedUsage`, marker
+`.token-repair-fork-copy-v1.done`, same guards, waits for the long-tier cost
+marker) re-reads, with baselines reset, sessions that spawned forked subagents.
+A fork's transcript starts with a `fork-context-ref` line and repeats the
+parent's spawning message (the one holding the Agent tool call) as the root of
+its sidechain: same `message.id` and usage, `parentUuid: null`. Earlier builds
+counted that copy once per fork on top of the parent's own record; the parsers
+now skip it (`isInheritedForkRecord` in `server/lib/token-usage.js`). The
+pre-repair rows are kept in `token_usage_pre_fork_copy_v1`.
 
 A hook landing mid-repair can lose a single write, since the sweep parses
 outside its transaction. That self-heals: with baselines zeroed, the next event

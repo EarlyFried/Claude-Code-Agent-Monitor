@@ -6,6 +6,12 @@
  */
 
 let Database;
+// Which SQLite library this process opened the database with. The read-only
+// worker (lib/readonly-query.js) must load the very same library: two SQLite
+// copies in one process do not see each other's POSIX locks, so the second one
+// believes it is the database's only user and truncates the `-shm` wal-index
+// the first still has memory-mapped — a SIGBUS crash.
+let sqliteDriver = { driver: "native", nativeModulePath: null };
 try {
   Database = require("better-sqlite3");
   // `require` only loads better-sqlite3's JS; its native addon is resolved
@@ -14,7 +20,11 @@ try {
   // for a different Node version — falls back to node:sqlite now, instead of
   // crashing later at the real `new Database(DB_PATH)` outside any try/catch.
   new Database(":memory:").close();
+  // Resolved here, on the main thread, so the desktop app's module redirect
+  // (which worker threads do not inherit) picks its Electron-ABI copy.
+  sqliteDriver.nativeModulePath = require.resolve("better-sqlite3");
 } catch {
+  sqliteDriver = { driver: "compat", nativeModulePath: null };
   try {
     Database = require("./compat-sqlite");
   } catch {
@@ -217,6 +227,12 @@ db.exec(`
     -- short/long is meaningful for GPT pricing (the per-request 272K
     -- boundary). Claude rows retain the harmless default short value.
     context_size TEXT NOT NULL DEFAULT 'short' CHECK(context_size IN ('short','long')),
+    -- Claude Code version of the process that made the requests (the
+    -- transcript entry's own "version"), so version-gated intro rates price
+    -- each message by the version that billed it. '' = not split by version
+    -- (rows written before this column, and non-Claude usage); those price by
+    -- the session's recorded version.
+    cc_version TEXT NOT NULL DEFAULT '',
     input_tokens INTEGER NOT NULL DEFAULT 0,
     output_tokens INTEGER NOT NULL DEFAULT 0,
     cache_read_tokens INTEGER NOT NULL DEFAULT 0,
@@ -236,7 +252,7 @@ db.exec(`
     baseline_web_search INTEGER NOT NULL DEFAULT 0,
     baseline_web_fetch INTEGER NOT NULL DEFAULT 0,
     baseline_code_execution INTEGER NOT NULL DEFAULT 0,
-    PRIMARY KEY (session_id, model, speed, inference_geo, service_tier, context_size),
+    PRIMARY KEY (session_id, model, speed, inference_geo, service_tier, context_size, cc_version),
     FOREIGN KEY (session_id) REFERENCES sessions(id) ON DELETE CASCADE
   );
 
@@ -253,6 +269,12 @@ db.exec(`
     -- caching multipliers (see server/lib/pricing-constants.js).
     fast_input_per_mtok REAL NOT NULL DEFAULT 0,
     fast_output_per_mtok REAL NOT NULL DEFAULT 0,
+    -- Long-prompt tier input/output rates, applied to token_usage rows stamped
+    -- context_size = 'long' (see CLAUDE_LONG_CONTEXT_TIERS in
+    -- server/lib/pricing-constants.js); 0 = no long tier (standard rates apply).
+    -- Cache rates scale with the long input base, as in fast mode.
+    long_input_per_mtok REAL NOT NULL DEFAULT 0,
+    long_output_per_mtok REAL NOT NULL DEFAULT 0,
     -- Time-limited introductory rates. When intro_until is set, usage on/before
     -- that date (YYYY-MM-DD) is priced at the intro_* rates and usage after it at
     -- the standard rates — so promo pricing (e.g. Claude Sonnet 5's launch
@@ -264,6 +286,11 @@ db.exec(`
     intro_cache_write_per_mtok REAL NOT NULL DEFAULT 0,
     intro_cache_write_1h_per_mtok REAL NOT NULL DEFAULT 0,
     intro_until TEXT,
+    -- Optional Claude Code version cutoff for the intro_* rates. When set and a
+    -- session's recorded Claude Code version is known, usage from versions up to
+    -- and including this one is priced at the intro_* rates instead of deciding
+    -- by date; sessions with no recorded version still use intro_until.
+    intro_until_version TEXT,
     updated_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ', 'now'))
   );
 
@@ -641,6 +668,28 @@ try {
   db.prepare("ALTER TABLE model_pricing ADD COLUMN intro_until TEXT").run();
 }
 
+// Migrate: add the Claude Code version cutoff for intro rates. Additive and
+// NULL by default, so every existing rule keeps deciding by intro_until alone.
+try {
+  db.prepare("SELECT intro_until_version FROM model_pricing LIMIT 1").get();
+} catch {
+  db.prepare("ALTER TABLE model_pricing ADD COLUMN intro_until_version TEXT").run();
+}
+
+// Migrate: add long-prompt tier rate columns to model_pricing. Additive and
+// default 0 (= no long tier), so existing rows price exactly as before until a
+// long rate is set (applyLongPricing below backfills the known defaults).
+try {
+  db.prepare("SELECT long_input_per_mtok FROM model_pricing LIMIT 1").get();
+} catch {
+  db.prepare(
+    "ALTER TABLE model_pricing ADD COLUMN long_input_per_mtok REAL NOT NULL DEFAULT 0"
+  ).run();
+  db.prepare(
+    "ALTER TABLE model_pricing ADD COLUMN long_output_per_mtok REAL NOT NULL DEFAULT 0"
+  ).run();
+}
+
 // Standard rates verified against https://platform.claude.com/docs/en/about-claude/pricing
 // on 2026-09-15. Default model pricing is shared by startup and reset.
 // Columns: pattern, display_name, input, output, cache_read (hits & refreshes),
@@ -686,12 +735,17 @@ const DEFAULT_PRICING = [
   // numbers; once it lapsed, usage fell back to the old $3/$15 standard and
   // over-reported by 50%. The promo row is now a no-op and is kept only so
   // existing DBs that already stamped intro_until keep their history.
-  // claude-sonnet-5-5: $2/$10 input/output, $0.20 cache read, $2.50 5m cache
-  // write, $4 1h cache write; no Fast mode. Same numbers as Sonnet 5 today, but
-  // it gets its own row: `claude-sonnet-5%` also LIKE-matches
-  // "claude-sonnet-5-5", so without one Sonnet 5.5 usage is labelled as Sonnet 5
-  // and silently follows every Sonnet 5 edit, intro stamp and rate correction.
-  ["claude-sonnet-5-5%", "Claude Sonnet 5.5", 2, 10, 0.2, 2.5, 4, 0, 0],
+  // claude-sonnet-5-5: $2/$10 input/output, $0.10 cache read (0.05x input, not
+  // the standard 0.1x — same as Opus 5.5; confirmed against Anthropic's rate card
+  // and Bedrock global pricing), $2.50 5m cache write, $4 1h cache write; no Fast
+  // mode. The cache read was $0.20 before its 50% cut, and Claude Code priced it
+  // at $0.20 through 2.1.295; DEFAULT_INTRO_PRICING below keeps that rate for
+  // those versions so session cost matches Claude's own figure.
+  // It differs from Sonnet 5 on cache reads and so gets its own row:
+  // `claude-sonnet-5%` also LIKE-matches "claude-sonnet-5-5", so without one
+  // Sonnet 5.5 usage is labelled as Sonnet 5 and silently follows every Sonnet 5
+  // edit, intro stamp and rate correction.
+  ["claude-sonnet-5-5%", "Claude Sonnet 5.5", 2, 10, 0.1, 2.5, 4, 0, 0],
   ["claude-sonnet-5%", "Claude Sonnet 5", 2, 10, 0.2, 2.5, 4, 0, 0],
   ["claude-sonnet-4-6%", "Claude Sonnet 4.6", 3, 15, 0.3, 3.75, 6, 0, 0],
   ["claude-sonnet-4-5%", "Claude Sonnet 4.5", 3, 15, 0.3, 3.75, 6, 0, 0],
@@ -699,7 +753,19 @@ const DEFAULT_PRICING = [
   ["claude-3-7-sonnet%", "Claude Sonnet 3.7", 3, 15, 0.3, 3.75, 6, 0, 0],
   ["claude-3-5-sonnet%", "Claude Sonnet 3.5", 3, 15, 0.3, 3.75, 6, 0, 0],
   // Haiku family
+  // claude-haiku-5-5: $0.10/$0.50 input/output, $0.01 cache read, $0.125 5m cache
+  // write, $0.20 1h cache write (standard 0.1x / 1.25x / 2x multipliers); no Fast
+  // mode. Anthropic charges $0.50/$2.50 (cache rates scale with it) for prompts
+  // over 100K tokens, but the Claude cost path has no per-request context tier
+  // (only Codex usage is stamped with context_size), so this row prices every
+  // request at the <=100K card and under-reports any longer prompt.
+  ["claude-haiku-5-5%", "Claude Haiku 5.5", 0.1, 0.5, 0.01, 0.125, 0.2, 0, 0],
   ["claude-haiku-4-5%", "Claude Haiku 4.5", 1, 5, 0.1, 1.25, 2, 0, 0],
+  // Amazon Bedrock model id (`anthropic.claude-haiku-4-5-20251001-v1:0`).
+  // Patterns match the whole model string, so `claude-haiku-4-5%` never reaches
+  // it and its usage priced at $0. Billed at the first-party card, which is how
+  // Claude Code prices it (Bedrock's in-region rate is 1.1x this).
+  ["anthropic.claude-haiku-4-5%", "Claude Haiku 4.5 (Bedrock)", 1, 5, 0.1, 1.25, 2, 0, 0],
   ["claude-3-5-haiku%", "Claude Haiku 3.5", 0.8, 4, 0.08, 1, 1.6, 0, 0],
   ["claude-3-haiku%", "Claude Haiku 3", 0.25, 1.25, 0.03, 0.3, 0.5, 0, 0],
   // Legacy
@@ -1051,28 +1117,93 @@ function correctSonnet5StandardRate(dbHandle = db) {
 }
 correctSonnet5StandardRate();
 
-// Known introductory promo rates: [pattern, in, out, cacheRead, cw5m, cw1h, until].
-// Standard rates live in the DEFAULT_PRICING row; these add the time-limited
-// discount on top. Claude Sonnet 5: 2/3-off launch pricing through 2026-08-31.
-const DEFAULT_INTRO_PRICING = [["claude-sonnet-5%", 2, 10, 0.2, 2.5, 4, "2026-08-31"]];
+// One-time correction of Sonnet 5.5's cache-read rate on EXISTING databases.
+// The row was seeded at $0.20, but Sonnet 5.5 now bills cache hits at 0.05x
+// input = $0.10, so newer cache reads — usually the largest share of a
+// session's cost — were over-reported 2x. The prior $0.20 lives on as an intro
+// rate (DEFAULT_INTRO_PRICING below) for Claude Code versions that still priced
+// it. Same guard as above: only a row still holding the exact old defaults is
+// rewritten, so user edits survive and re-running is a no-op. Cost is computed
+// at request time, so history reprices.
+function correctSonnet55CacheReadRate(dbHandle = db) {
+  return dbHandle
+    .prepare(
+      `UPDATE model_pricing
+          SET cache_read_per_mtok = 0.1
+        WHERE model_pattern = 'claude-sonnet-5-5%'
+          AND input_per_mtok = 2
+          AND output_per_mtok = 10
+          AND cache_read_per_mtok = 0.2
+          AND cache_write_per_mtok = 2.5
+          AND cache_write_1h_per_mtok = 4`
+    )
+    .run();
+}
+correctSonnet55CacheReadRate();
+
+// Known intro rates: [pattern, in, out, cacheRead, cw5m, cw1h, until, untilVersion].
+// Standard rates live in the DEFAULT_PRICING row; these replace them for usage
+// on or before `until` — or, when `untilVersion` is set and the session's Claude
+// Code version is known, for usage recorded by that version or older. A 0 keeps
+// the standard rate for that field (see ratesForBucket in routes/pricing.js).
+// Claude Sonnet 5: 2/3-off launch pricing through 2026-08-31.
+// Claude Sonnet 5.5: cache reads at the prior $0.20. Claude Code priced them at
+// $0.20 through 2.1.295 and $0.10 from 2.1.296 (its changelog); the date is the
+// fallback for sessions with no recorded version — the day before the 50% cut
+// took effect on 2026-10-07 (Amazon Bedrock pricing note).
+const DEFAULT_INTRO_PRICING = [
+  ["claude-sonnet-5%", 2, 10, 0.2, 2.5, 4, "2026-08-31", null],
+  ["claude-sonnet-5-5%", 0, 0, 0.2, 0, 0, "2026-10-06", "2.1.295"],
+];
 
 // Backfill the known intro rates. Only fills rows whose intro_until is still
 // NULL, so a user who edits or clears an intro rate in Settings is never
 // overwritten. Shared by startup and the reset-pricing endpoint (which
 // re-seeds standard rates and must re-apply the intro discount too, else Sonnet
-// 5 would silently price at standard until the next restart).
+// 5 would silently price at standard until the next restart). A row that already
+// holds a default's exact date and rates but no version cutoff gets the cutoff
+// added — the same default, stamped before the cutoff existed.
 function applyIntroPricing(dbHandle = db) {
   const setIntro = dbHandle.prepare(
     `UPDATE model_pricing SET
        intro_input_per_mtok = ?, intro_output_per_mtok = ?, intro_cache_read_per_mtok = ?,
-       intro_cache_write_per_mtok = ?, intro_cache_write_1h_per_mtok = ?, intro_until = ?
+       intro_cache_write_per_mtok = ?, intro_cache_write_1h_per_mtok = ?, intro_until = ?,
+       intro_until_version = ?
      WHERE model_pattern = ? AND intro_until IS NULL`
   );
-  for (const [pattern, inp, out, cr, cw5m, cw1h, until] of DEFAULT_INTRO_PRICING) {
-    setIntro.run(inp, out, cr, cw5m, cw1h, until, pattern);
+  const addVersion = dbHandle.prepare(
+    `UPDATE model_pricing SET intro_until_version = ?
+     WHERE model_pattern = ? AND intro_until = ? AND intro_until_version IS NULL
+       AND intro_input_per_mtok = ? AND intro_output_per_mtok = ? AND intro_cache_read_per_mtok = ?
+       AND intro_cache_write_per_mtok = ? AND intro_cache_write_1h_per_mtok = ?`
+  );
+  for (const [pattern, inp, out, cr, cw5m, cw1h, until, untilVersion] of DEFAULT_INTRO_PRICING) {
+    setIntro.run(inp, out, cr, cw5m, cw1h, until, untilVersion, pattern);
+    if (untilVersion) addVersion.run(untilVersion, pattern, until, inp, out, cr, cw5m, cw1h);
   }
 }
 applyIntroPricing();
+
+// Known long-prompt tier rates: [pattern, longInput, longOutput]. Cache rates
+// are derived from the long input base at pricing time. Claude Haiku 5.5:
+// $0.50/$2.50 for prompts over 100K tokens (standard row is $0.10/$0.50).
+const DEFAULT_LONG_PRICING = [["claude-haiku-5-5%", 0.5, 2.5]];
+
+// Backfill the known long-tier rates. Only fills rows whose long rates are both
+// still 0, so a rate the user edited in Settings is never overwritten. Shared
+// by startup and the reset-pricing endpoint (which re-seeds standard rates and
+// must re-apply the long tier too, else long prompts would silently price at
+// the standard rate until the next restart).
+function applyLongPricing(dbHandle = db) {
+  const setLong = dbHandle.prepare(
+    `UPDATE model_pricing SET long_input_per_mtok = ?, long_output_per_mtok = ?
+     WHERE model_pattern = ? AND long_input_per_mtok = 0 AND long_output_per_mtok = 0`
+  );
+  for (const [pattern, longIn, longOut] of DEFAULT_LONG_PRICING) {
+    setLong.run(longIn, longOut, pattern);
+  }
+}
+applyLongPricing();
 
 // Migrate: if token_usage has rows without model column (old schema), add it
 try {
@@ -1529,6 +1660,68 @@ try {
     FROM token_usage_pre_context_size
   `);
   db.prepare("DROP TABLE token_usage_pre_context_size").run();
+  db.pragma("foreign_keys = ON");
+}
+
+// Migrate: add the Claude Code version bucket. SQLite cannot extend the
+// composite primary key in place, so the table is rebuilt (atomically). Every
+// existing row maps to '' (not split by version), which prices by the session's
+// recorded version exactly as before; writers fold such a row into versioned
+// rows the next time they rewrite its bucket (see writeTokenBuckets in
+// server/lib/token-usage.js), so totals carry over without double counting.
+try {
+  db.prepare("SELECT cc_version FROM token_usage LIMIT 1").get();
+} catch {
+  db.pragma("foreign_keys = OFF");
+  db.transaction(() => {
+    db.prepare("ALTER TABLE token_usage RENAME TO token_usage_pre_cc_version").run();
+    db.exec(`
+      CREATE TABLE token_usage (
+        session_id TEXT NOT NULL,
+        model TEXT NOT NULL DEFAULT 'unknown',
+        speed TEXT NOT NULL DEFAULT 'standard',
+        inference_geo TEXT NOT NULL DEFAULT 'global',
+        service_tier TEXT NOT NULL DEFAULT 'standard',
+        context_size TEXT NOT NULL DEFAULT 'short' CHECK(context_size IN ('short','long')),
+        cc_version TEXT NOT NULL DEFAULT '',
+        input_tokens INTEGER NOT NULL DEFAULT 0,
+        output_tokens INTEGER NOT NULL DEFAULT 0,
+        cache_read_tokens INTEGER NOT NULL DEFAULT 0,
+        cache_write_tokens INTEGER NOT NULL DEFAULT 0,
+        cache_write_1h_tokens INTEGER NOT NULL DEFAULT 0,
+        web_search_requests INTEGER NOT NULL DEFAULT 0,
+        web_fetch_requests INTEGER NOT NULL DEFAULT 0,
+        code_execution_requests INTEGER NOT NULL DEFAULT 0,
+        baseline_input INTEGER NOT NULL DEFAULT 0,
+        baseline_output INTEGER NOT NULL DEFAULT 0,
+        baseline_cache_read INTEGER NOT NULL DEFAULT 0,
+        baseline_cache_write INTEGER NOT NULL DEFAULT 0,
+        baseline_cache_write_1h INTEGER NOT NULL DEFAULT 0,
+        baseline_web_search INTEGER NOT NULL DEFAULT 0,
+        baseline_web_fetch INTEGER NOT NULL DEFAULT 0,
+        baseline_code_execution INTEGER NOT NULL DEFAULT 0,
+        PRIMARY KEY (session_id, model, speed, inference_geo, service_tier, context_size, cc_version),
+        FOREIGN KEY (session_id) REFERENCES sessions(id) ON DELETE CASCADE
+      )
+    `);
+    db.exec(`
+      INSERT INTO token_usage (
+        session_id, model, speed, inference_geo, service_tier, context_size, cc_version,
+        input_tokens, output_tokens, cache_read_tokens, cache_write_tokens, cache_write_1h_tokens,
+        web_search_requests, web_fetch_requests, code_execution_requests,
+        baseline_input, baseline_output, baseline_cache_read, baseline_cache_write,
+        baseline_cache_write_1h, baseline_web_search, baseline_web_fetch, baseline_code_execution
+      )
+      SELECT
+        session_id, model, speed, inference_geo, service_tier, context_size, '',
+        input_tokens, output_tokens, cache_read_tokens, cache_write_tokens, cache_write_1h_tokens,
+        web_search_requests, web_fetch_requests, code_execution_requests,
+        baseline_input, baseline_output, baseline_cache_read, baseline_cache_write,
+        baseline_cache_write_1h, baseline_web_search, baseline_web_fetch, baseline_code_execution
+      FROM token_usage_pre_cc_version
+    `);
+    db.prepare("DROP TABLE token_usage_pre_cc_version").run();
+  })();
   db.pragma("foreign_keys = ON");
 }
 
@@ -2002,7 +2195,7 @@ const stmts = {
     INSERT INTO token_usage (session_id, model, speed, inference_geo, service_tier, context_size,
                              input_tokens, output_tokens, cache_read_tokens, cache_write_tokens)
     VALUES (?, ?, 'standard', 'global', 'standard', 'short', ?, ?, ?, ?)
-    ON CONFLICT(session_id, model, speed, inference_geo, service_tier, context_size) DO UPDATE SET
+    ON CONFLICT(session_id, model, speed, inference_geo, service_tier, context_size, cc_version) DO UPDATE SET
       input_tokens = input_tokens + excluded.input_tokens,
       output_tokens = output_tokens + excluded.output_tokens,
       cache_read_tokens = cache_read_tokens + excluded.cache_read_tokens,
@@ -2027,8 +2220,11 @@ const stmts = {
   // cache-read while baseline claimed 8.5B). Transcripts are append-only, so a
   // full re-parse always sees the complete total; the high-water mark preserves
   // the true max across writer-scope noise and re-imports without ever
-  // double-counting. Args, in order:
-  //   session_id, model, speed, inference_geo, service_tier,
+  // double-counting. This statement writes the unversioned (cc_version '')
+  // row; transcript-derived writes go through writeTokenBuckets
+  // (server/lib/token-usage.js), which applies the same mark across a bucket's
+  // version rows. Args, in order:
+  //   session_id, model, speed, inference_geo, service_tier, context_size,
   //   input, output, cache_read, cache_write, cache_write_1h,
   //   web_search, web_fetch, code_execution
   replaceTokenUsage: db.prepare(`
@@ -2037,8 +2233,8 @@ const stmts = {
                              web_search_requests, web_fetch_requests, code_execution_requests,
                              baseline_input, baseline_output, baseline_cache_read, baseline_cache_write, baseline_cache_write_1h,
                              baseline_web_search, baseline_web_fetch, baseline_code_execution)
-    VALUES (?, ?, ?, ?, ?, 'short', ?, ?, ?, ?, ?, ?, ?, ?, 0, 0, 0, 0, 0, 0, 0, 0)
-    ON CONFLICT(session_id, model, speed, inference_geo, service_tier, context_size) DO UPDATE SET
+    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 0, 0, 0, 0, 0, 0, 0, 0)
+    ON CONFLICT(session_id, model, speed, inference_geo, service_tier, context_size, cc_version) DO UPDATE SET
       baseline_input = MAX(input_tokens + baseline_input - excluded.input_tokens, 0),
       baseline_output = MAX(output_tokens + baseline_output - excluded.output_tokens, 0),
       baseline_cache_read = MAX(cache_read_tokens + baseline_cache_read - excluded.cache_read_tokens, 0),
@@ -2070,8 +2266,8 @@ const stmts = {
                              web_search_requests, web_fetch_requests, code_execution_requests,
                              baseline_input, baseline_output, baseline_cache_read, baseline_cache_write, baseline_cache_write_1h,
                              baseline_web_search, baseline_web_fetch, baseline_code_execution)
-    VALUES (?, ?, ?, ?, ?, 'short', ?, ?, ?, ?, ?, ?, ?, ?, 0, 0, 0, 0, 0, 0, 0, 0)
-    ON CONFLICT(session_id, model, speed, inference_geo, service_tier, context_size) DO UPDATE SET
+    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 0, 0, 0, 0, 0, 0, 0, 0)
+    ON CONFLICT(session_id, model, speed, inference_geo, service_tier, context_size, cc_version) DO UPDATE SET
       input_tokens = excluded.input_tokens,
       output_tokens = excluded.output_tokens,
       cache_read_tokens = excluded.cache_read_tokens,
@@ -2089,6 +2285,64 @@ const stmts = {
       baseline_web_fetch = 0,
       baseline_code_execution = 0
   `),
+  // Credit tokens that Claude Code billed but never wrote to the transcript
+  // (the /compact summary request, WebFetch's secondary-model calls) — see
+  // server/lib/cost-state.js. The amounts go into the baseline_* columns, which
+  // every reader already sums with the live columns, and are ADDED to whatever
+  // baseline the bucket holds. Args, in order:
+  //   session_id, model, speed, inference_geo, service_tier, context_size,
+  //   cc_version, input, output, cache_read, cache_write, cache_write_1h, web_search
+  addTokenUsageBaseline: db.prepare(`
+    INSERT INTO token_usage (session_id, model, speed, inference_geo, service_tier, context_size,
+                             cc_version, baseline_input, baseline_output, baseline_cache_read,
+                             baseline_cache_write, baseline_cache_write_1h, baseline_web_search)
+    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+    ON CONFLICT(session_id, model, speed, inference_geo, service_tier, context_size, cc_version) DO UPDATE SET
+      baseline_input = baseline_input + excluded.baseline_input,
+      baseline_output = baseline_output + excluded.baseline_output,
+      baseline_cache_read = baseline_cache_read + excluded.baseline_cache_read,
+      baseline_cache_write = baseline_cache_write + excluded.baseline_cache_write,
+      baseline_cache_write_1h = baseline_cache_write_1h + excluded.baseline_cache_write_1h,
+      baseline_web_search = baseline_web_search + excluded.baseline_web_search
+  `),
+  // Every Claude Code version row of one bucket (session, model, speed, geo,
+  // tier, context size) — read, cleared, and rewritten as a unit by
+  // writeTokenBuckets (server/lib/token-usage.js).
+  getTokenBucketVersions: db.prepare(`
+    SELECT cc_version,
+      input_tokens as input, output_tokens as output, cache_read_tokens as cacheRead,
+      cache_write_tokens as cacheWrite, cache_write_1h_tokens as cacheWrite1h,
+      web_search_requests as webSearch, web_fetch_requests as webFetch,
+      code_execution_requests as codeExec,
+      baseline_input as b_input, baseline_output as b_output,
+      baseline_cache_read as b_cacheRead, baseline_cache_write as b_cacheWrite,
+      baseline_cache_write_1h as b_cacheWrite1h, baseline_web_search as b_webSearch,
+      baseline_web_fetch as b_webFetch, baseline_code_execution as b_codeExec
+    FROM token_usage
+    WHERE session_id = ? AND model = ? AND speed = ? AND inference_geo = ?
+      AND service_tier = ? AND context_size = ?
+  `),
+  deleteTokenBucketVersions: db.prepare(`
+    DELETE FROM token_usage
+    WHERE session_id = ? AND model = ? AND speed = ? AND inference_geo = ?
+      AND service_tier = ? AND context_size = ?
+  `),
+  // One row by its full key (the six bucket columns and cc_version).
+  deleteTokenUsageRow: db.prepare(`
+    DELETE FROM token_usage
+    WHERE session_id = ? AND model = ? AND speed = ? AND inference_geo = ?
+      AND service_tier = ? AND context_size = ? AND cc_version = ?
+  `),
+  // Args: the seven key columns, the eight live counts, then the eight baselines.
+  insertTokenUsageRow: db.prepare(`
+    INSERT INTO token_usage (session_id, model, speed, inference_geo, service_tier, context_size,
+                             cc_version,
+                             input_tokens, output_tokens, cache_read_tokens, cache_write_tokens, cache_write_1h_tokens,
+                             web_search_requests, web_fetch_requests, code_execution_requests,
+                             baseline_input, baseline_output, baseline_cache_read, baseline_cache_write, baseline_cache_write_1h,
+                             baseline_web_search, baseline_web_fetch, baseline_code_execution)
+    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+  `),
   // Incremental Codex counter deltas. Unlike the full Claude re-parser, Codex
   // rollouts expose an authoritative per-request delta, so we only ever add a
   // newly observed request to its model/tier/context-size bucket.
@@ -2097,7 +2351,7 @@ const stmts = {
       session_id, model, speed, inference_geo, service_tier, context_size,
       input_tokens, output_tokens, cache_read_tokens, cache_write_tokens
     ) VALUES (?, ?, ?, 'global', 'standard', ?, ?, ?, ?, ?)
-    ON CONFLICT(session_id, model, speed, inference_geo, service_tier, context_size) DO UPDATE SET
+    ON CONFLICT(session_id, model, speed, inference_geo, service_tier, context_size, cc_version) DO UPDATE SET
       input_tokens = input_tokens + excluded.input_tokens,
       output_tokens = output_tokens + excluded.output_tokens,
       cache_read_tokens = cache_read_tokens + excluded.cache_read_tokens,
@@ -2145,7 +2399,7 @@ const stmts = {
     FROM token_usage
   `),
   getTokensBySession: db.prepare(
-    `SELECT model, speed, inference_geo, service_tier, context_size,
+    `SELECT model, speed, inference_geo, service_tier, context_size, cc_version,
       input_tokens + baseline_input as input_tokens,
       output_tokens + baseline_output as output_tokens,
       cache_read_tokens + baseline_cache_read as cache_read_tokens,
@@ -2189,6 +2443,26 @@ const stmts = {
       intro_cache_write_per_mtok = ?,
       intro_cache_write_1h_per_mtok = ?,
       intro_until = ?,
+      updated_at = strftime('%Y-%m-%dT%H:%M:%fZ', 'now')
+    WHERE model_pattern = ?
+  `),
+  // Update ONLY the intro rates' Claude Code version cutoff. Separate from
+  // setIntroPricing so a client that sends the intro block without this field
+  // (the Settings UI) keeps the stored cutoff.
+  setIntroVersion: db.prepare(`
+    UPDATE model_pricing SET
+      intro_until_version = ?,
+      updated_at = strftime('%Y-%m-%dT%H:%M:%fZ', 'now')
+    WHERE model_pattern = ?
+  `),
+  // Update ONLY the long-prompt tier rates for an existing row. Separate from
+  // upsertPricing for the same reason as setIntroPricing: the PUT route calls it
+  // only when the caller sends long_* fields, so clients that omit them keep the
+  // stored long tier.
+  setLongPricing: db.prepare(`
+    UPDATE model_pricing SET
+      long_input_per_mtok = ?,
+      long_output_per_mtok = ?,
       updated_at = strftime('%Y-%m-%dT%H:%M:%fZ', 'now')
     WHERE model_pattern = ?
   `),
@@ -2491,7 +2765,7 @@ const stmts = {
 // Heavy HTTP counts use a lazy read-only worker. In-memory databases retain
 // their existing synchronous connection; a different worker cannot share them.
 const { ReadonlyQuery, databaseGeneration } = require("./lib/readonly-query");
-const queryReader = DB_PATH === ":memory:" ? null : new ReadonlyQuery(DB_PATH);
+const queryReader = DB_PATH === ":memory:" ? null : new ReadonlyQuery(DB_PATH, sqliteDriver);
 const closeDatabase = db.close.bind(db);
 db.close = () => {
   if (queryReader) queryReader.close();
@@ -2700,7 +2974,9 @@ module.exports = {
   DEFAULT_GPT_PRICING,
   DEFAULT_CURSOR_PRICING,
   applyIntroPricing,
+  applyLongPricing,
   correctSonnet5StandardRate,
+  correctSonnet55CacheReadRate,
   seedGptPricing,
   seedCursorPricing,
   repairLegacyGptPricing,

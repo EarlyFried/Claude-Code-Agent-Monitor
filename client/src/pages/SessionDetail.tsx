@@ -345,6 +345,22 @@ const EVENTS_MAX_REFRESH = 500;
 const EVENTS_REFRESH_DEBOUNCE_MS = 500;
 
 /**
+ * Cost breakdown table cell for one token type: the token count, with that type's USD cost for the
+ * row's model beneath it. The cost line is omitted when the server sent no per-type costs or the
+ * row has no tokens of this type.
+ */
+function TokenCostCell({ tokens, cost }: { tokens: number; cost: number | undefined }) {
+  return (
+    <td className="px-5 py-2.5 text-sm text-gray-400 text-right font-mono">
+      {tokens.toLocaleString()}
+      {cost !== undefined && tokens > 0 && (
+        <div className="text-[11px] text-emerald-400/80">{fmtCostFull(cost)}</div>
+      )}
+    </td>
+  );
+}
+
+/**
  * Session Detail page (`/sessions/:id`). Shows the session header with cost and status, the
  * overview stats, and three tabs mirrored in the URL. The Agents tab is the agent tree. The
  * Conversation tab is the transcript, for the main agent or any subagent. The Timeline tab is the
@@ -1312,20 +1328,18 @@ export function SessionDetail() {
                         <td className="px-5 py-2.5 text-sm font-mono text-gray-300">
                           {formatModelName(row.model)}
                         </td>
-                        <td className="px-5 py-2.5 text-sm text-gray-400 text-right font-mono">
-                          {row.input_tokens.toLocaleString()}
-                        </td>
-                        <td className="px-5 py-2.5 text-sm text-gray-400 text-right font-mono">
-                          {row.output_tokens.toLocaleString()}
-                        </td>
-                        <td className="px-5 py-2.5 text-sm text-gray-400 text-right font-mono">
-                          {row.cache_read_tokens.toLocaleString()}
-                        </td>
-                        <td className="px-5 py-2.5 text-sm text-gray-400 text-right font-mono">
-                          {row.cache_write_tokens.toLocaleString()}
-                        </td>
+                        <TokenCostCell tokens={row.input_tokens} cost={row.cost_by_type?.input} />
+                        <TokenCostCell tokens={row.output_tokens} cost={row.cost_by_type?.output} />
+                        <TokenCostCell
+                          tokens={row.cache_read_tokens}
+                          cost={row.cost_by_type?.cache_read}
+                        />
+                        <TokenCostCell
+                          tokens={row.cache_write_tokens}
+                          cost={row.cost_by_type?.cache_write}
+                        />
                         <td className="px-5 py-2.5 text-sm text-emerald-400 text-right font-mono font-medium">
-                          {fmtCostFull(row.cost, 4)}
+                          {fmtCostFull(row.cost)}
                         </td>
                       </tr>
                     ))}
@@ -1334,7 +1348,7 @@ export function SessionDetail() {
                         {t("common:total")}
                       </td>
                       <td className="px-5 py-2.5 text-sm text-emerald-400 text-right font-mono font-semibold">
-                        {fmtCostFull(cost.total_cost, 4)}
+                        {fmtCostFull(cost.total_cost)}
                       </td>
                     </tr>
                   </tbody>

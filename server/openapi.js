@@ -384,6 +384,11 @@ function createOpenApiSpec() {
                 "Timestamp of the latest durable session event, falling back to lifecycle timestamps only for eventless historical rows. Unlike updated_at, metadata bookkeeping does not change this value.",
             },
             cost: { type: "number", nullable: true },
+            total_tokens: {
+              type: "integer",
+              description:
+                "Total tokens consumed (input + output + cache read + cache write across models). Present on list rows; 0 when the session has no token usage.",
+            },
             has_token_usage: {
               type: "boolean",
               nullable: true,
@@ -1056,6 +1061,15 @@ function createOpenApiSpec() {
               type: "number",
               description: "Fast-mode output rate (0 = none)",
             },
+            long_input_per_mtok: {
+              type: "number",
+              description:
+                "Input rate for requests whose prompt exceeds the model's long-prompt limit (0 = no long tier). Cache rates scale with it. Omit to keep the stored value.",
+            },
+            long_output_per_mtok: {
+              type: "number",
+              description: "Output rate for long-prompt requests (0 = no long tier).",
+            },
             updated_at: { type: "string", format: "date-time" },
           },
         },
@@ -1077,6 +1091,15 @@ function createOpenApiSpec() {
             fast_output_per_mtok: {
               type: "number",
               description: "Fast-mode output rate (0 = none)",
+            },
+            long_input_per_mtok: {
+              type: "number",
+              description:
+                "Input rate for requests whose prompt exceeds the model's long-prompt limit (0 = no long tier). Cache rates scale with it. Omit to keep the stored value.",
+            },
+            long_output_per_mtok: {
+              type: "number",
+              description: "Output rate for long-prompt requests (0 = no long tier).",
             },
           },
         },
@@ -1227,8 +1250,21 @@ function createOpenApiSpec() {
             web_search_requests: { type: "integer" },
             web_fetch_requests: { type: "integer" },
             code_execution_requests: { type: "integer" },
-            cost: { type: "number" },
+            cost: { type: "number", description: "Cost in USD, rounded to 4 decimals" },
+            cost_exact: { type: "number", description: "The same cost, unrounded" },
+            cost_by_type: { $ref: "#/components/schemas/CostByType" },
             matched_rule: { type: "string", nullable: true },
+          },
+        },
+        CostByType: {
+          type: "object",
+          description:
+            "Token cost in USD split by token type. Server-tool surcharges are excluded, so the sum can be below the parent cost. 5-minute and 1-hour cache writes are combined under cache_write.",
+          properties: {
+            input: { type: "number" },
+            output: { type: "number" },
+            cache_read: { type: "number" },
+            cache_write: { type: "number" },
           },
         },
         DailyCostItem: {
@@ -1243,9 +1279,15 @@ function createOpenApiSpec() {
           type: "object",
           required: ["total_cost", "breakdown", "daily_costs"],
           properties: {
-            total_cost: { type: "number" },
+            total_cost: { type: "number", description: "Total cost in USD, rounded to 4 decimals" },
+            total_cost_exact: {
+              type: "number",
+              description:
+                "The same total, unrounded, for exact comparison with Claude Code's own cost record",
+            },
             breakdown: { type: "array", items: { $ref: "#/components/schemas/CostBreakdownItem" } },
             daily_costs: { type: "array", items: { $ref: "#/components/schemas/DailyCostItem" } },
+            cost_by_type: { $ref: "#/components/schemas/CostByType" },
             feature_costs: {
               type: "object",
               description: "Server-tool surcharges separate from token cost",
@@ -1741,7 +1783,11 @@ function createOpenApiSpec() {
               name: "sort_by",
               in: "query",
               required: false,
-              schema: { type: "string", enum: ["time", "duration", "price"], default: "time" },
+              schema: {
+                type: "string",
+                enum: ["time", "duration", "price", "tokens"],
+                default: "time",
+              },
               description: "Session ordering dimension.",
             },
             {
@@ -2456,6 +2502,17 @@ function createOpenApiSpec() {
                           speed: { type: "string" },
                           inference_geo: { type: "string" },
                           service_tier: { type: "string" },
+                          context_size: {
+                            type: "string",
+                            enum: ["short", "long"],
+                            description:
+                              "Prompt-size class for models with a long-prompt rate tier; omitted = short.",
+                          },
+                          cc_version: {
+                            type: "string",
+                            description:
+                              "Claude Code version that made these requests (e.g. 2.1.296), for version-gated rates. Omitted or malformed = unsplit; priced by the session's version.",
+                          },
                           input: { type: "integer", minimum: 0 },
                           output: { type: "integer", minimum: 0 },
                           cacheRead: { type: "integer", minimum: 0 },

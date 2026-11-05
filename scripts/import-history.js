@@ -17,6 +17,7 @@ const path = require("path");
 const readline = require("readline");
 const { isLocalHistoryOwner } = require("../server/lib/session-origin");
 const {
+  contextSizeFor,
   bucketKey,
   emptyBucket,
   extractUsageFields,
@@ -25,8 +26,18 @@ const {
   normalizeSpeed,
   normalizeGeo,
   normalizeTier,
+  normalizeCcVersion,
   accumulateBucket,
+  writeTokenBuckets,
+  isInheritedForkRecord,
 } = require("../server/lib/token-usage");
+const {
+  parseCostStateEntry,
+  applyCostState,
+  newCostStateTracker,
+  trackEntryVersion,
+  trackCostState,
+} = require("../server/lib/cost-state");
 
 const {
   getClaudeHome,
@@ -167,6 +178,12 @@ async function parseSessionFile(filePath) {
   // metadata lines, so the last value seen wins.
   let customTitle = null;
   let aiTitle = null;
+  // Claude's own saved per-model token totals (`cost-state`, appended on save;
+  // last wins). Covers API calls that leave no assistant message — see
+  // server/lib/cost-state.js.
+  let costState = null;
+  // Splits cost-state increases by the Claude Code version that wrote them.
+  const costStateTracker = newCostStateTracker();
   // First real user prompt (tool-result / meta / command entries skipped) —
   // fallback descriptor for sessions that never got a title. First wins.
   let firstUserMessage = null;
@@ -184,12 +201,18 @@ async function parseSessionFile(filePath) {
       continue;
     }
 
+    trackEntryVersion(costStateTracker, entry);
     if (entry.type === "custom-title" && typeof entry.customTitle === "string") {
       if (entry.customTitle.trim()) customTitle = entry.customTitle.trim();
       continue;
     }
     if (entry.type === "ai-title" && typeof entry.aiTitle === "string") {
       if (entry.aiTitle.trim()) aiTitle = entry.aiTitle.trim();
+      continue;
+    }
+    if (entry.type === "cost-state") {
+      const parsed = parseCostStateEntry(entry);
+      if (parsed) costState = trackCostState(costStateTracker, parsed);
       continue;
     }
 
@@ -282,28 +305,39 @@ async function parseSessionFile(filePath) {
       const msg = entry.message || {};
       const msgModel = msg.model || null;
       if (!model && msgModel && msgModel !== "<synthetic>") model = msgModel;
-      if (msgModel && msgModel !== "<synthetic>" && msg.usage) {
+      // A fork's copy of its parent's spawning message is counted in the parent.
+      if (msgModel && msgModel !== "<synthetic>" && msg.usage && !isInheritedForkRecord(entry)) {
         const usage = msg.usage;
         const usageMsgId = typeof msg.id === "string" && msg.id ? msg.id : null;
         if (usageMsgId) {
           const prev = usageByMessageId.get(usageMsgId);
           if (prev) subtractBucket(tokensByModel[prev.key], prev.fields);
         }
+        const fields = extractUsageFields(usage);
+        // Long-prompt rate tier (see CLAUDE_LONG_CONTEXT_TIERS): "short" for
+        // every model without one.
+        const ctx = contextSizeFor(msgModel, fields);
+        // The Claude Code version that made this request (a resumed session
+        // can span releases); version-gated rates price each message by it.
+        const ccVersion = normalizeCcVersion(entry.version);
         const key = bucketKey(
           msgModel,
           normalizeSpeed(usage),
           normalizeGeo(usage),
-          normalizeTier(usage)
+          normalizeTier(usage),
+          ctx,
+          ccVersion
         );
         if (tokensByModel[key] === undefined) {
           tokensByModel[key] = emptyBucket(
             msgModel,
             normalizeSpeed(usage),
             normalizeGeo(usage),
-            normalizeTier(usage)
+            normalizeTier(usage),
+            ctx,
+            ccVersion
           );
         }
-        const fields = extractUsageFields(usage);
         accumulateBucket(tokensByModel[key], fields);
         if (usageMsgId) rememberUsageContribution(usageByMessageId, usageMsgId, { key, fields });
       }
@@ -374,6 +408,7 @@ async function parseSessionFile(filePath) {
     userMessages: userMessageCount,
     assistantMessages: assistantMessageCount,
     tokensByModel,
+    costState,
     messageTimestamps,
     toolUses,
     compactions,
@@ -480,29 +515,36 @@ async function parseSubagentFile(filePath) {
       if (!model && msgModel && msgModel !== "<synthetic>") model = msgModel;
       // Same reconciliation as parseSessionFile: one API response spans
       // several records (same message.id) whose usage evolves — the last
-      // record is authoritative.
-      if (msgModel && msgModel !== "<synthetic>" && msg.usage) {
+      // record is authoritative. A fork's copy of its parent's spawning
+      // message is skipped: the parent transcript already counts it.
+      if (msgModel && msgModel !== "<synthetic>" && msg.usage && !isInheritedForkRecord(entry)) {
         const usage = msg.usage;
         const usageMsgId = typeof msg.id === "string" && msg.id ? msg.id : null;
         if (usageMsgId) {
           const prev = usageByMessageId.get(usageMsgId);
           if (prev) subtractBucket(tokensByModel[prev.key], prev.fields);
         }
+        const fields = extractUsageFields(usage);
+        const ctx = contextSizeFor(msgModel, fields);
+        const ccVersion = normalizeCcVersion(entry.version);
         const key = bucketKey(
           msgModel,
           normalizeSpeed(usage),
           normalizeGeo(usage),
-          normalizeTier(usage)
+          normalizeTier(usage),
+          ctx,
+          ccVersion
         );
         if (!tokensByModel[key]) {
           tokensByModel[key] = emptyBucket(
             msgModel,
             normalizeSpeed(usage),
             normalizeGeo(usage),
-            normalizeTier(usage)
+            normalizeTier(usage),
+            ctx,
+            ccVersion
           );
         }
-        const fields = extractUsageFields(usage);
         accumulateBucket(tokensByModel[key], fields);
         if (usageMsgId) rememberUsageContribution(usageByMessageId, usageMsgId, { key, fields });
       }
@@ -794,7 +836,14 @@ function combineSessionTokens(session) {
     if (!src) return;
     for (const [key, tok] of Object.entries(src)) {
       if (!combined[key]) {
-        combined[key] = emptyBucket(tok.model, tok.speed, tok.geo, tok.tier);
+        combined[key] = emptyBucket(
+          tok.model,
+          tok.speed,
+          tok.geo,
+          tok.tier,
+          tok.ctx,
+          tok.ccVersion
+        );
       }
       accumulateBucket(combined[key], tok);
     }
@@ -807,19 +856,14 @@ function combineSessionTokens(session) {
 }
 
 /**
- * Write a session's per-model token totals via replaceTokenUsage. Safe to call
- * repeatedly: the underlying SQL preserves the highest-seen value via the
- * baseline_* columns, so a re-run never reduces totals.
+ * Write a session's per-model token totals via writeTokenBuckets (one row per
+ * Claude Code version). Safe to call repeatedly: it keeps each bucket's
+ * highest-seen total via the baseline_* columns, so a re-run never reduces
+ * totals.
  */
 function writeSessionTokens(dbModule, sessionId, tokensByModel, options = {}) {
-  const { stmts } = dbModule;
-  // resetBaselines: the totals come from a full transcript re-parse and are
-  // the whole truth — zero the compaction baselines instead of letting the
-  // high-water-mark fold preserve a historical over-count.
-  const stmt = options.resetBaselines ? stmts.resetTokenUsage : stmts.replaceTokenUsage;
-  let written = 0;
-  for (const tokens of Object.values(tokensByModel || {})) {
-    if (
+  const buckets = Object.values(tokensByModel || {}).filter(
+    (tokens) =>
       (tokens.input || 0) > 0 ||
       (tokens.output || 0) > 0 ||
       (tokens.cacheRead || 0) > 0 ||
@@ -827,26 +871,26 @@ function writeSessionTokens(dbModule, sessionId, tokensByModel, options = {}) {
       (tokens.webSearch || 0) > 0 ||
       (tokens.webFetch || 0) > 0 ||
       (tokens.codeExec || 0) > 0
-    ) {
-      stmt.run(
-        sessionId,
-        tokens.model,
-        tokens.speed,
-        tokens.geo,
-        tokens.tier,
-        tokens.input || 0,
-        tokens.output || 0,
-        tokens.cacheRead || 0,
-        tokens.cacheWrite || 0,
-        tokens.cacheWrite1h || 0,
-        tokens.webSearch || 0,
-        tokens.webFetch || 0,
-        tokens.codeExec || 0
-      );
-      written++;
-    }
+  );
+  // writeTokenBuckets clears and rewrites each bucket's rows; a savepoint keeps
+  // that atomic for callers outside a transaction (live SubagentStop,
+  // workflow ingest) and nests inside one for the batch importers.
+  const { db } = dbModule;
+  db.exec("SAVEPOINT write_session_tokens");
+  try {
+    // resetBaselines: the totals come from a full transcript re-parse and are
+    // the whole truth — zero the compaction baselines instead of letting the
+    // high-water-mark fold preserve a historical over-count.
+    const written = writeTokenBuckets(dbModule.stmts, sessionId, buckets, {
+      reset: !!options.resetBaselines,
+    });
+    db.exec("RELEASE write_session_tokens");
+    return written;
+  } catch (err) {
+    db.exec("ROLLBACK TO write_session_tokens");
+    db.exec("RELEASE write_session_tokens");
+    throw err;
   }
-  return written;
 }
 
 /**
@@ -865,6 +909,8 @@ function subagentTokenRows(tokensByModel) {
       speed: b.speed,
       inference_geo: b.geo,
       service_tier: b.tier,
+      context_size: b.ctx === "long" ? "long" : "short",
+      cc_version: b.ccVersion || "",
       input_tokens: b.input || 0,
       output_tokens: b.output || 0,
       cache_read_tokens: b.cacheRead || 0,
@@ -1555,6 +1601,12 @@ function importSession(dbModule, session, importOptions = {}) {
     // session with subagent tokens must not look like new work.
     if (tokensChanged) backfilled = true;
 
+    // Top up to Claude's own saved totals (calls that leave no transcript
+    // message). Idempotent: a session already at those figures is untouched.
+    if (applyCostState(dbModule.stmts, session.sessionId, session.costState) > 0) {
+      backfilled = true;
+    }
+
     return backfilled ? { skipped: false, backfilled: true } : { skipped: true };
   }
 
@@ -1771,6 +1823,7 @@ function importSession(dbModule, session, importOptions = {}) {
   }
 
   writeSessionTokens(dbModule, session.sessionId, combineSessionTokens(session));
+  applyCostState(dbModule.stmts, session.sessionId, session.costState);
 
   return { skipped: false };
 }
@@ -2135,6 +2188,11 @@ async function syncDefaultProjects(dbModule, options = {}) {
  * writes the re-derivation as the whole truth with zeroed baselines — the
  * repair for databases inflated before usage was reconciled per message.id.
  * `options.all` widens the sweep beyond `imported`-marked sessions.
+ * Every mode finishes each session by topping its totals up to Claude's own
+ * saved `cost-state` figures (calls that leave no transcript message — see
+ * server/lib/cost-state.js); `options.costStateOnly` does ONLY that, leaving
+ * the transcript-derived rows exactly as stored and skipping the subagent
+ * parse, for the one-time backfill of sessions recorded before it existed.
  *
  * Returns { reconciled, sessionsTouched, modelsWritten, missingFiles }.
  */
@@ -2186,7 +2244,7 @@ async function reconcileTokens(dbModule, options = {}) {
   // They were previously excluded only by accident (their transcripts live
   // outside PROJECTS_DIR, so the directory scan never matched them); resolving
   // `transcript_path` below removes that accident, hence the explicit filter.
-  const known = options.all
+  const candidates = options.all
     ? dbModule.db
         .prepare("SELECT id, transcript_path FROM sessions WHERE provider = 'claude'")
         .all()
@@ -2195,6 +2253,11 @@ async function reconcileTokens(dbModule, options = {}) {
           "SELECT id, transcript_path FROM sessions WHERE provider = 'claude' AND metadata LIKE '%\"imported\":true%'"
         )
         .all();
+  // options.sessionIds narrows the sweep to specific sessions (the provider
+  // guard above still applies) — used by targeted repairs such as the
+  // long-prompt re-split, which only needs the sessions that used one model.
+  const sessionFilter = Array.isArray(options.sessionIds) ? new Set(options.sessionIds) : null;
+  const known = sessionFilter ? candidates.filter((row) => sessionFilter.has(row.id)) : candidates;
 
   const total = known.length;
   let processed = 0;
@@ -2211,13 +2274,20 @@ async function reconcileTokens(dbModule, options = {}) {
         "DELETE FROM token_usage WHERE session_id = ? AND service_tier != 'workflow'"
       )
     : null;
+  const costStateOnly = !!options.costStateOnly;
   const tx = dbModule.db.transaction((batch) => {
-    for (const { sessionId, tokens } of batch) {
-      if (clearSessionTokens) clearSessionTokens.run(sessionId);
-      const written = writeSessionTokens(dbModule, sessionId, tokens, writeOptions);
-      if (written > 0) {
+    for (const { sessionId, tokens, costState } of batch) {
+      let written = 0;
+      if (!costStateOnly) {
+        if (clearSessionTokens) clearSessionTokens.run(sessionId);
+        written = writeSessionTokens(dbModule, sessionId, tokens, writeOptions);
+      }
+      // After the transcript-derived rows, so the top-up sees the final totals
+      // (and survives a reset, which zeroes the baselines it writes into).
+      const toppedUp = applyCostState(dbModule.stmts, sessionId, costState);
+      if (written > 0 || toppedUp > 0) {
         counters.sessionsTouched++;
-        counters.modelsWritten += written;
+        counters.modelsWritten += Math.max(written, toppedUp);
       }
       counters.reconciled++;
     }
@@ -2255,6 +2325,20 @@ async function reconcileTokens(dbModule, options = {}) {
         continue;
       }
 
+      if (costStateOnly) {
+        if (session.costState) {
+          batch.push({ sessionId, tokens: {}, costState: session.costState });
+          if (batch.length >= FLUSH) {
+            tx(batch);
+            batch = [];
+          }
+        } else {
+          counters.reconciled++;
+        }
+        if (processed % 25 === 0) onProgress({ processed, total, counters });
+        continue;
+      }
+
       // Attach subagents discovered next to this session.
       const subPaths = findSessionSubagents(jsonlPath);
       if (subPaths.length > 0) {
@@ -2273,8 +2357,8 @@ async function reconcileTokens(dbModule, options = {}) {
       // In reset mode an EMPTY corrected derivation still has to reach the
       // transaction: the session's stale rows must be cleared even when
       // nothing replaces them.
-      if (Object.keys(tokens).length > 0 || writeOptions.resetBaselines) {
-        batch.push({ sessionId, tokens });
+      if (Object.keys(tokens).length > 0 || writeOptions.resetBaselines || session.costState) {
+        batch.push({ sessionId, tokens, costState: session.costState });
         if (batch.length >= FLUSH) {
           tx(batch);
           batch = [];
@@ -3040,6 +3124,77 @@ async function backfillSubagentTokenMetadata(dbModule) {
   return { sessions: scanned, stamped };
 }
 
+/**
+ * The `version` of the first transcript entry that carries one (the Claude Code
+ * version the session started under), or null. Stops reading at the first hit.
+ */
+async function readFirstCcVersion(transcriptPath) {
+  const stream = fs.createReadStream(transcriptPath, { encoding: "utf8" });
+  const rl = readline.createInterface({ input: stream, crlfDelay: Infinity });
+  try {
+    for await (const line of rl) {
+      if (!line.includes('"version"')) continue;
+      try {
+        const entry = JSON.parse(line);
+        if (typeof entry.version === "string" && entry.version) return entry.version;
+      } catch {
+        /* partial or non-JSON line */
+      }
+    }
+    return null;
+  } finally {
+    rl.close();
+    stream.destroy();
+  }
+}
+
+/**
+ * Backfill metadata.version onto Claude sessions recorded by the live hook path
+ * before it stored one. The version prices version-gated intro rates (rules
+ * with `intro_until_version`, e.g. Sonnet 5.5 cache reads at $0.20 for Claude
+ * Code up to 2.1.295); without it those sessions fall back to the date.
+ *
+ * METADATA ONLY and idempotent: a session whose transcript yields no version is
+ * stamped `version: null`, so every session drops out of the driving query
+ * after one look and steady-state startups do no work. updated_at is left alone.
+ */
+async function backfillSessionVersions(dbModule) {
+  const { db } = dbModule;
+  let sessions;
+  try {
+    sessions = db
+      .prepare(
+        `SELECT id, transcript_path AS tp FROM sessions
+         WHERE transcript_path IS NOT NULL
+           AND COALESCE(provider, 'claude') = 'claude'
+           AND (metadata IS NULL OR (json_valid(metadata) AND json_type(metadata, '$.version') IS NULL))`
+      )
+      .all();
+  } catch {
+    return { sessions: 0, stamped: 0 };
+  }
+  const stamp = db.prepare(
+    `UPDATE sessions SET metadata = json_set(COALESCE(metadata, '{}'), '$.version', ?)
+     WHERE id = ? AND (metadata IS NULL OR json_valid(metadata))`
+  );
+  let stamped = 0;
+  for (const s of sessions) {
+    let version = null;
+    try {
+      if (fs.existsSync(s.tp)) version = await readFirstCcVersion(s.tp);
+    } catch {
+      version = null;
+    }
+    try {
+      stamp.run(version, s.id);
+      if (version) stamped++;
+    } catch {
+      /* non-fatal — the session simply prices by date */
+    }
+  }
+  return { sessions: sessions.length, stamped };
+}
+
 module.exports = {
   importAllSessions,
   syncDefaultProjects,
@@ -3050,6 +3205,7 @@ module.exports = {
   importApiErrors,
   importSubagentFromJsonl,
   backfillSubagentTokenMetadata,
+  backfillSessionVersions,
   reconcileSubagentParents,
   parseSessionFile,
   parseSubagentFile,

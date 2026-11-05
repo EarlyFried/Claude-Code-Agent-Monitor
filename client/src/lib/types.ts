@@ -1107,6 +1107,9 @@ export interface Session {
    *  active pricing rules. Only present on responses that attach pricing.
    *  Absolute dollars (e.g. `0.42`), already summed across all buckets. */
   cost?: number;
+  /** Total tokens the session consumed (input + output + cache read + cache
+   *  write, summed across models). Only present on `/api/sessions` list rows. */
+  total_tokens?: number;
   /** ISO timestamp set when an agent CLI is blocked waiting for the user
    * (permission prompt or "waiting for your input" notice). Cleared when the
    * source reports that work has resumed. Null when the session is not waiting.
@@ -1612,6 +1615,12 @@ export interface ModelPricing {
   fast_input_per_mtok: number;
   /** Premium output rate applied when a token bucket's `speed` is "fast". */
   fast_output_per_mtok: number;
+  /** Input/output rates for requests whose prompt exceeds the model's long-prompt
+   *  limit (e.g. Claude Haiku 5.5 over 100K tokens); 0 / absent = no long tier.
+   *  Cache rates scale with the long input base. The Settings editor does not
+   *  expose these yet; a PUT that omits them keeps the stored values. */
+  long_input_per_mtok?: number;
+  long_output_per_mtok?: number;
   // Time-limited introductory rates: usage on/before intro_until (YYYY-MM-DD)
   // prices at these rates, after it at the standard rates. null/0 = no intro.
   /** Intro input rate (USD/MTok) while the promo is active; null/0 = no promo. */
@@ -1701,6 +1710,18 @@ export interface CursorModelPricing {
   updated_at: string;
 }
 
+/** USD token cost split by token type. Server-tool surcharges are not included. */
+export interface CostByType {
+  /** USD spent on fresh input tokens. */
+  input: number;
+  /** USD spent on output tokens. */
+  output: number;
+  /** USD spent on prompt-cache reads. */
+  cache_read: number;
+  /** USD spent on prompt-cache writes (5-minute and 1-hour combined). */
+  cache_write: number;
+}
+
 /**
  * One row of a {@link CostResult.breakdown} - token usage and cost aggregated
  * per (model, speed, inference_geo, service_tier) tuple. Emitted by
@@ -1748,6 +1769,9 @@ export interface CostBreakdown {
   /** USD cost for this bucket (token cost + web-search surcharge). Sum of all
    *  buckets' `cost` (plus feature costs) equals {@link CostResult.total_cost}. */
   cost: number;
+  /** USD token cost of this bucket split by token type; excludes the web-search
+   *  surcharge, so the four values can sum to less than `cost`. */
+  cost_by_type?: CostByType;
   /** The `ModelPricing.model_pattern` that matched, or null if no rule matched
    *  (in which case `cost` is 0 and the usage also appears in `unpriced_models`). */
   matched_rule: string | null;
@@ -1799,6 +1823,9 @@ export interface CostResult {
   /** Total cost per local calendar day, oldest first. Each `date` is a
    *  `YYYY-MM-DD` bucket; backs the spend-over-time line chart. */
   daily_costs: Array<{ date: string; cost: number }>;
+  /** Token cost in USD split by token type (surcharges excluded), so it can sum
+   *  to less than `total_cost`. Backs the "Token cost" bar on Session detail. */
+  cost_by_type?: CostByType;
   /** Web-search/web-fetch/code-execution surcharges; absent when none applied. */
   feature_costs?: CostFeatureCosts;
   /** Present only when at least one model had usage but no pricing rule. */

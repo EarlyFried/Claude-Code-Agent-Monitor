@@ -296,6 +296,7 @@ import {
   FilterX,
   FolderOpen,
   FolderTree,
+  Hash,
   Github,
   Globe,
   Heart,
@@ -491,6 +492,12 @@ export const PAGE_ACTION_COMMANDS: {
     labelKey: "sessions:sortPriceHighest",
     icon: DollarSign,
     keywords: ["sort", "expensive", "price"],
+  },
+  {
+    id: "sessions.sortTokens",
+    labelKey: "sessions:sortTokensHighest",
+    icon: Hash,
+    keywords: ["sort", "tokens", "usage"],
   },
   {
     id: "sessions.toggleSortDirection",

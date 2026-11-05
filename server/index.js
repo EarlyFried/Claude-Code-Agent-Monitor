@@ -406,6 +406,583 @@ function repairInflatedTokenTotals() {
 }
 
 /**
+ * One-time re-split of existing sessions' token buckets by prompt size, for
+ * models with a long-prompt rate tier (CLAUDE_LONG_CONTEXT_TIERS — currently
+ * Claude Haiku 5.5).
+ *
+ * Before the context dimension existed, every request of such a model landed in
+ * the single "short" bucket, so a stored row mixes short and long prompts and
+ * cannot be split after the fact. It also cannot be left to the live writers:
+ * `replaceTokenUsage` is a high-water mark, so the first re-parse after the
+ * upgrade (short bucket now smaller, long bucket new) would fold the old short
+ * total into `baseline_*` and count the long tokens twice. Re-reading each
+ * affected transcript with baselines reset heals both.
+ *
+ * Only sessions that already have a row for a long-tier model are re-derived, so
+ * every other model's history is untouched. Same guards as
+ * repairInflatedTokenTotals: a `.token-repair-long-context-v1.done` marker
+ * written only after a completed pass, `DASHBOARD_TOKEN_REPAIR=0` opt-out,
+ * skipped (no marker) while another dashboard shares the data directory, and a
+ * one-table snapshot (`token_usage_pre_long_context_v1`) kept for recovery. It
+ * also waits for the v2 repair marker: that pass already re-derives every
+ * session with this parser, and running both at once would race.
+ */
+function repairLongContextTokenTotals() {
+  try {
+    const fs = require("fs");
+    if (process.env.DASHBOARD_TOKEN_REPAIR === "0") return;
+
+    const dbModule = require("./db");
+    const dataDir = path.dirname(dbModule.DB_PATH);
+    const markerPath = path.join(dataDir, ".token-repair-long-context-v1.done");
+    if (fs.existsSync(markerPath)) return;
+    if (!fs.existsSync(path.join(dataDir, ".token-repair-v2.done"))) return;
+
+    let peers = [];
+    try {
+      peers = peersSharingDataDir() || [];
+    } catch {
+      /* discovery is best-effort; treat an unreadable peer list as "alone" */
+    }
+    if (peers.length > 0) {
+      console.log("Long-context token repair deferred: another dashboard shares this database.");
+      return;
+    }
+
+    const { CLAUDE_LONG_CONTEXT_TIERS } = require("./lib/pricing-constants");
+    const timer = setTimeout(() => {
+      (async () => {
+        try {
+          const models = dbModule.db
+            .prepare("SELECT DISTINCT model FROM token_usage WHERE service_tier != 'workflow'")
+            .all()
+            .map((r) => r.model)
+            .filter((m) => CLAUDE_LONG_CONTEXT_TIERS.some((t) => t.pattern.test(m)));
+          const sessionIds = models.length
+            ? dbModule.db
+                .prepare(
+                  `SELECT DISTINCT session_id FROM token_usage
+                    WHERE service_tier != 'workflow'
+                      AND model IN (${models.map(() => "?").join(",")})`
+                )
+                .all(...models)
+                .map((r) => r.session_id)
+            : [];
+          if (sessionIds.length > 0) {
+            dbModule.db.exec(
+              "CREATE TABLE IF NOT EXISTS token_usage_pre_long_context_v1 AS SELECT * FROM token_usage"
+            );
+            const { reconcileTokens } = require("../scripts/import-history");
+            const result = await reconcileTokens(dbModule, {
+              all: true,
+              resetBaselines: true,
+              sessionIds,
+            });
+            if (result.sessionsTouched > 0) {
+              console.log(
+                `Re-split token totals by prompt size for ${result.sessionsTouched} session(s). ` +
+                  `Pre-repair values kept in token_usage_pre_long_context_v1.`
+              );
+            }
+          }
+          try {
+            fs.writeFileSync(markerPath, `${new Date().toISOString()}\n`);
+          } catch {
+            /* non-fatal — the (idempotent) repair simply re-runs next start */
+          }
+        } catch (err) {
+          console.warn("long-context token repair failed:", err.message);
+        }
+      })();
+    }, 12_000);
+    if (timer.unref) timer.unref();
+  } catch (err) {
+    console.warn("long-context token repair could not start:", err.message);
+  }
+}
+
+/**
+ * One-time backfill of tokens that Claude Code billed but never wrote to a
+ * transcript message: the `/compact` summarisation request and the
+ * secondary-model (Haiku) call WebFetch runs over each fetched page. The only
+ * record of them is the `cost-state` entry Claude appends when it saves a
+ * session's cost, which the live hook path now applies as sessions end — this
+ * sweep covers sessions recorded before that existed (see
+ * server/lib/cost-state.js).
+ *
+ * Purely additive: the sweep leaves the transcript-derived rows alone
+ * (`costStateOnly`) and only raises a model's totals when Claude's figure is
+ * higher, so it is safe to re-run. Same guards as repairLongContextTokenTotals:
+ * a `.token-repair-cost-state-v1.done` marker written only after a completed
+ * pass, `DASHBOARD_TOKEN_REPAIR=0` opt-out, deferred while another dashboard
+ * shares the data directory, a one-table snapshot
+ * (`token_usage_pre_cost_state_v1`) kept for recovery, and it waits for the
+ * earlier repairs' markers so two re-derivations never race.
+ */
+function repairCostStateTokenTotals() {
+  try {
+    const fs = require("fs");
+    if (process.env.DASHBOARD_TOKEN_REPAIR === "0") return;
+
+    const dbModule = require("./db");
+    const dataDir = path.dirname(dbModule.DB_PATH);
+    const markerPath = path.join(dataDir, ".token-repair-cost-state-v1.done");
+    if (fs.existsSync(markerPath)) return;
+    if (!fs.existsSync(path.join(dataDir, ".token-repair-v2.done"))) return;
+    if (!fs.existsSync(path.join(dataDir, ".token-repair-long-context-v1.done"))) return;
+
+    let peers = [];
+    try {
+      peers = peersSharingDataDir() || [];
+    } catch {
+      /* discovery is best-effort; treat an unreadable peer list as "alone" */
+    }
+    if (peers.length > 0) {
+      console.log("Cost-state token backfill deferred: another dashboard shares this database.");
+      return;
+    }
+
+    const timer = setTimeout(() => {
+      (async () => {
+        try {
+          dbModule.db.exec(
+            "CREATE TABLE IF NOT EXISTS token_usage_pre_cost_state_v1 AS SELECT * FROM token_usage"
+          );
+          const { reconcileTokens } = require("../scripts/import-history");
+          const result = await reconcileTokens(dbModule, { all: true, costStateOnly: true });
+          if (result.sessionsTouched > 0) {
+            console.log(
+              `Topped up token totals for ${result.sessionsTouched} session(s) to Claude's own ` +
+                `saved usage. Pre-backfill values kept in token_usage_pre_cost_state_v1.`
+            );
+          }
+          try {
+            fs.writeFileSync(markerPath, `${new Date().toISOString()}\n`);
+          } catch {
+            /* non-fatal — the (idempotent) backfill simply re-runs next start */
+          }
+        } catch (err) {
+          console.warn("cost-state token backfill failed:", err.message);
+        }
+      })();
+    }, 16_000);
+    if (timer.unref) timer.unref();
+  } catch (err) {
+    console.warn("cost-state token backfill could not start:", err.message);
+  }
+}
+
+/**
+ * Second one-time cost-state pass, healing two gaps the first left behind:
+ *
+ * 1. Cache-write TTL of top-up-only buckets. A model seen only through
+ *    cost-state (WebFetch's Haiku, a model whose calls never became messages)
+ *    had its unrecorded cache writes priced as 5m writes, while Claude Code
+ *    requests the same TTL for every model in a process — 1h in practice. Such
+ *    a bucket (no recorded writes, every baseline write 5m) now takes the 1h
+ *    share of the session's recorded writes, matching computeCostStateTopUps.
+ * 2. Records the live path never saw. Claude Code appends cost-state as it
+ *    exits, which can land after the SessionEnd hook read the transcript; the
+ *    hook route now re-checks shortly after SessionEnd, and this re-runs the
+ *    raise-only backfill once for sessions that ended before that existed.
+ *
+ * Same guards as repairCostStateTokenTotals: a `.token-repair-cost-state-v2.done`
+ * marker written only after a completed pass, `DASHBOARD_TOKEN_REPAIR=0`
+ * opt-out, deferral while another dashboard shares the data directory, a
+ * snapshot (`token_usage_pre_cost_state_v2`), and it waits for the v1 marker.
+ */
+function repairCostStateTokenTotalsV2() {
+  try {
+    const fs = require("fs");
+    if (process.env.DASHBOARD_TOKEN_REPAIR === "0") return;
+
+    const dbModule = require("./db");
+    const dataDir = path.dirname(dbModule.DB_PATH);
+    const markerPath = path.join(dataDir, ".token-repair-cost-state-v2.done");
+    if (fs.existsSync(markerPath)) return;
+    if (!fs.existsSync(path.join(dataDir, ".token-repair-cost-state-v1.done"))) return;
+
+    let peers = [];
+    try {
+      peers = peersSharingDataDir() || [];
+    } catch {
+      /* discovery is best-effort; treat an unreadable peer list as "alone" */
+    }
+    if (peers.length > 0) {
+      console.log("Cost-state token repair v2 deferred: another dashboard shares this database.");
+      return;
+    }
+
+    const timer = setTimeout(() => {
+      (async () => {
+        try {
+          const { db } = dbModule;
+          db.exec(
+            "CREATE TABLE IF NOT EXISTS token_usage_pre_cost_state_v2 AS SELECT * FROM token_usage"
+          );
+          const candidates = db
+            .prepare(
+              `WITH recorded AS (
+                 SELECT session_id, SUM(cache_write_tokens) AS writes,
+                        SUM(cache_write_1h_tokens) AS writes_1h
+                   FROM token_usage WHERE service_tier != 'workflow'
+                  GROUP BY session_id)
+               SELECT t.rowid AS rid, t.baseline_cache_write AS b_cw,
+                      1.0 * r.writes_1h / r.writes AS share
+                 FROM token_usage t
+                 JOIN recorded r ON r.session_id = t.session_id
+                 JOIN sessions s ON s.id = t.session_id
+                WHERE t.service_tier != 'workflow'
+                  AND COALESCE(s.provider, 'claude') = 'claude'
+                  AND t.cache_write_tokens = 0
+                  AND t.baseline_cache_write > 0
+                  AND t.baseline_cache_write_1h = 0
+                  AND r.writes > 0 AND r.writes_1h > 0`
+            )
+            .all();
+          const setShare = db.prepare(
+            "UPDATE token_usage SET baseline_cache_write_1h = ? WHERE rowid = ?"
+          );
+          db.transaction(() => {
+            for (const c of candidates) {
+              setShare.run(Math.round(c.b_cw * Math.min(c.share, 1)), c.rid);
+            }
+          })();
+
+          const { reconcileTokens } = require("../scripts/import-history");
+          const result = await reconcileTokens(dbModule, { all: true, costStateOnly: true });
+          if (candidates.length > 0 || result.sessionsTouched > 0) {
+            console.log(
+              `Cost-state repair v2: re-split ${candidates.length} cache-write bucket(s), topped up ` +
+                `${result.sessionsTouched} session(s). Prior values kept in token_usage_pre_cost_state_v2.`
+            );
+          }
+          try {
+            fs.writeFileSync(markerPath, `${new Date().toISOString()}\n`);
+          } catch {
+            /* non-fatal — both steps are idempotent, so the pass simply re-runs */
+          }
+        } catch (err) {
+          console.warn("cost-state token repair v2 failed:", err.message);
+        }
+      })();
+    }, 20_000);
+    if (timer.unref) timer.unref();
+  } catch (err) {
+    console.warn("cost-state token repair v2 could not start:", err.message);
+  }
+}
+
+/**
+ * One-time split of existing sessions' token buckets by Claude Code version.
+ *
+ * Rows written before `token_usage.cc_version` existed hold every version's
+ * usage under '' and price by the session's first recorded version, so a
+ * session resumed across a release that repriced a rate (Sonnet 5.5's cache
+ * read at 2.1.296) priced its later messages at the earlier rate. Re-reading
+ * each such session's transcripts splits the rows by the version that made each
+ * request (writeTokenBuckets keeps every bucket's total), and the cost-state
+ * pass then moves the '' remainder — earlier top-ups — onto the versions
+ * Claude's own records name (see trackCostState). Total-preserving, so safe to
+ * re-run.
+ *
+ * A database that ran the first release of this pass (marker
+ * `.token-repair-cc-version-v1.done`), which shared those top-ups out by usage
+ * instead, re-derives its sessions that span versions from their transcripts
+ * (baselines reset, cost-state re-applied).
+ *
+ * Same guards as repairCostStateTokenTotalsV2: a `.token-repair-cc-version-v2.done`
+ * marker written only after a completed pass, `DASHBOARD_TOKEN_REPAIR=0`
+ * opt-out, deferral while another dashboard shares the data directory, a
+ * snapshot (`token_usage_pre_cc_version_v2`), and it waits for the
+ * cost-state v2 marker so two re-derivations never race.
+ */
+function repairCcVersionTokenSplit() {
+  try {
+    const fs = require("fs");
+    if (process.env.DASHBOARD_TOKEN_REPAIR === "0") return;
+
+    const dbModule = require("./db");
+    const dataDir = path.dirname(dbModule.DB_PATH);
+    const markerPath = path.join(dataDir, ".token-repair-cc-version-v2.done");
+    if (fs.existsSync(markerPath)) return;
+    if (!fs.existsSync(path.join(dataDir, ".token-repair-cost-state-v2.done"))) return;
+    const ranFirstSplit = fs.existsSync(path.join(dataDir, ".token-repair-cc-version-v1.done"));
+
+    let peers = [];
+    try {
+      peers = peersSharingDataDir() || [];
+    } catch {
+      /* discovery is best-effort; treat an unreadable peer list as "alone" */
+    }
+    if (peers.length > 0) {
+      console.log(
+        "Claude Code version token split deferred: another dashboard shares this database."
+      );
+      return;
+    }
+
+    const timer = setTimeout(() => {
+      (async () => {
+        try {
+          const { db } = dbModule;
+          const claudeRows = `FROM token_usage tu JOIN sessions s ON s.id = tu.session_id
+                WHERE tu.service_tier != 'workflow' AND COALESCE(s.provider, 'claude') = 'claude'`;
+          const unsplit = db
+            .prepare(`SELECT DISTINCT tu.session_id AS id ${claudeRows} AND tu.cc_version = ''`)
+            .all()
+            .map((r) => r.id);
+          const spanning = ranFirstSplit
+            ? db
+                .prepare(
+                  `SELECT tu.session_id AS id ${claudeRows} AND tu.cc_version != ''
+                    GROUP BY tu.session_id HAVING COUNT(DISTINCT tu.cc_version) > 1`
+                )
+                .all()
+                .map((r) => r.id)
+            : [];
+          if (unsplit.length > 0 || spanning.length > 0) {
+            db.exec(
+              "CREATE TABLE IF NOT EXISTS token_usage_pre_cc_version_v2 AS SELECT * FROM token_usage"
+            );
+            const { reconcileTokens } = require("../scripts/import-history");
+            let touched = 0;
+            if (unsplit.length > 0) {
+              touched += (await reconcileTokens(dbModule, { all: true, sessionIds: unsplit }))
+                .sessionsTouched;
+            }
+            if (spanning.length > 0) {
+              touched += (
+                await reconcileTokens(dbModule, {
+                  all: true,
+                  resetBaselines: true,
+                  sessionIds: spanning,
+                })
+              ).sessionsTouched;
+            }
+            if (touched > 0) {
+              console.log(
+                `Split token totals by Claude Code version for ${touched} session(s). ` +
+                  `Pre-split values kept in token_usage_pre_cc_version_v2.`
+              );
+            }
+          }
+          try {
+            fs.writeFileSync(markerPath, `${new Date().toISOString()}\n`);
+          } catch {
+            /* non-fatal — the (total-preserving) split simply re-runs next start */
+          }
+        } catch (err) {
+          console.warn("Claude Code version token split failed:", err.message);
+        }
+      })();
+    }, 24_000);
+    if (timer.unref) timer.unref();
+  } catch (err) {
+    console.warn("Claude Code version token split could not start:", err.message);
+  }
+}
+
+/**
+ * One-time re-derivation of sessions whose long-prompt-tier model (Claude Haiku
+ * 5.5) has usage beyond its transcript. Those top-ups come only from Claude's
+ * `cost-state` totals, which carry no prompt size, so earlier builds put them
+ * all on the model's largest bucket — usually the long one — and billed small
+ * calls (WebFetch, titles) at long rates. applyCostState now splits them by
+ * Claude's own cost for the model; this pass re-reads the affected sessions
+ * from their transcripts (baselines reset, cost-state re-applied) so stored
+ * top-ups are split the same way.
+ *
+ * Same guards as repairCcVersionTokenSplit: a
+ * `.token-repair-long-tier-cost-v1.done` marker written only after a completed
+ * pass, `DASHBOARD_TOKEN_REPAIR=0` opt-out, deferral while another dashboard
+ * shares the data directory, a snapshot (`token_usage_pre_long_tier_cost_v1`),
+ * and it waits for the cc-version v2 marker so two re-derivations never race.
+ */
+function repairLongTierCostSplit() {
+  try {
+    const fs = require("fs");
+    if (process.env.DASHBOARD_TOKEN_REPAIR === "0") return;
+
+    const dbModule = require("./db");
+    const dataDir = path.dirname(dbModule.DB_PATH);
+    const markerPath = path.join(dataDir, ".token-repair-long-tier-cost-v1.done");
+    if (fs.existsSync(markerPath)) return;
+    if (!fs.existsSync(path.join(dataDir, ".token-repair-cc-version-v2.done"))) return;
+
+    let peers = [];
+    try {
+      peers = peersSharingDataDir() || [];
+    } catch {
+      /* discovery is best-effort; treat an unreadable peer list as "alone" */
+    }
+    if (peers.length > 0) {
+      console.log(
+        "Long-prompt tier top-up split deferred: another dashboard shares this database."
+      );
+      return;
+    }
+
+    const timer = setTimeout(() => {
+      (async () => {
+        try {
+          const { db } = dbModule;
+          const { CLAUDE_LONG_CONTEXT_TIERS } = require("./lib/pricing-constants");
+          const ids = [
+            ...new Set(
+              db
+                .prepare(
+                  `SELECT tu.session_id AS id, tu.model FROM token_usage tu
+                     JOIN sessions s ON s.id = tu.session_id
+                    WHERE tu.service_tier != 'workflow' AND COALESCE(s.provider, 'claude') = 'claude'
+                      AND (tu.baseline_input + tu.baseline_output + tu.baseline_cache_read
+                           + tu.baseline_cache_write) > 0`
+                )
+                .all()
+                .filter((r) => CLAUDE_LONG_CONTEXT_TIERS.some((t) => t.pattern.test(r.model)))
+                .map((r) => r.id)
+            ),
+          ];
+          if (ids.length > 0) {
+            db.exec(
+              "CREATE TABLE IF NOT EXISTS token_usage_pre_long_tier_cost_v1 AS SELECT * FROM token_usage"
+            );
+            const { reconcileTokens } = require("../scripts/import-history");
+            const { sessionsTouched } = await reconcileTokens(dbModule, {
+              all: true,
+              resetBaselines: true,
+              sessionIds: ids,
+            });
+            if (sessionsTouched > 0) {
+              console.log(
+                `Split long-prompt tier top-ups by Claude's cost for ${sessionsTouched} session(s). ` +
+                  `Pre-repair values kept in token_usage_pre_long_tier_cost_v1.`
+              );
+            }
+          }
+          try {
+            fs.writeFileSync(markerPath, `${new Date().toISOString()}\n`);
+          } catch {
+            /* non-fatal — the re-derivation simply re-runs next start */
+          }
+        } catch (err) {
+          console.warn("Long-prompt tier top-up split failed:", err.message);
+        }
+      })();
+    }, 28_000);
+    if (timer.unref) timer.unref();
+  } catch (err) {
+    console.warn("Long-prompt tier top-up split could not start:", err.message);
+  }
+}
+
+/** True when a subagent transcript starts as a fork of its parent session. */
+function isForkTranscript(filePath) {
+  const fs = require("fs");
+  let fd;
+  try {
+    fd = fs.openSync(filePath, "r");
+    const buf = Buffer.alloc(512);
+    const n = fs.readSync(fd, buf, 0, buf.length, 0);
+    return buf.toString("utf8", 0, n).includes('"type":"fork-context-ref"');
+  } catch {
+    return false;
+  } finally {
+    if (fd !== undefined) fs.closeSync(fd);
+  }
+}
+
+/**
+ * One-time re-derivation of sessions that spawned forked subagents. A fork's
+ * transcript repeats the parent's spawning message, and earlier builds counted
+ * that copy once per fork on top of the parent's own record (see
+ * isInheritedForkRecord in lib/token-usage.js). The parsers now skip the copy;
+ * because token totals are a high-water mark, the stored over-count only drops
+ * when the session is re-read with its baselines reset (cost-state re-applied).
+ *
+ * Same guards as repairLongTierCostSplit: a `.token-repair-fork-copy-v1.done`
+ * marker written only after a completed pass, `DASHBOARD_TOKEN_REPAIR=0`
+ * opt-out, deferral while another dashboard shares the data directory, a
+ * snapshot (`token_usage_pre_fork_copy_v1`), and it waits for the long-tier
+ * cost marker so two re-derivations never race.
+ */
+function repairForkCopiedUsage() {
+  try {
+    const fs = require("fs");
+    if (process.env.DASHBOARD_TOKEN_REPAIR === "0") return;
+
+    const dbModule = require("./db");
+    const dataDir = path.dirname(dbModule.DB_PATH);
+    const markerPath = path.join(dataDir, ".token-repair-fork-copy-v1.done");
+    if (fs.existsSync(markerPath)) return;
+    if (!fs.existsSync(path.join(dataDir, ".token-repair-long-tier-cost-v1.done"))) return;
+
+    let peers = [];
+    try {
+      peers = peersSharingDataDir() || [];
+    } catch {
+      /* discovery is best-effort; treat an unreadable peer list as "alone" */
+    }
+    if (peers.length > 0) {
+      console.log("Forked-subagent token repair deferred: another dashboard shares this database.");
+      return;
+    }
+
+    const timer = setTimeout(() => {
+      (async () => {
+        try {
+          const { db } = dbModule;
+          const ids = db
+            .prepare(
+              `SELECT id, transcript_path FROM sessions
+                WHERE transcript_path IS NOT NULL AND COALESCE(provider, 'claude') = 'claude'`
+            )
+            .all()
+            .filter((s) => {
+              const dir = path.join(s.transcript_path.replace(/\.jsonl$/, ""), "subagents");
+              try {
+                return fs
+                  .readdirSync(dir)
+                  .some((f) => f.endsWith(".jsonl") && isForkTranscript(path.join(dir, f)));
+              } catch {
+                return false;
+              }
+            })
+            .map((s) => s.id);
+          if (ids.length > 0) {
+            db.exec(
+              "CREATE TABLE IF NOT EXISTS token_usage_pre_fork_copy_v1 AS SELECT * FROM token_usage"
+            );
+            const { reconcileTokens } = require("../scripts/import-history");
+            const { sessionsTouched } = await reconcileTokens(dbModule, {
+              all: true,
+              resetBaselines: true,
+              sessionIds: ids,
+            });
+            if (sessionsTouched > 0) {
+              console.log(
+                `Removed forked-subagent copies of parent messages for ${sessionsTouched} session(s). ` +
+                  `Pre-repair values kept in token_usage_pre_fork_copy_v1.`
+              );
+            }
+          }
+          try {
+            fs.writeFileSync(markerPath, `${new Date().toISOString()}\n`);
+          } catch {
+            /* non-fatal — the re-derivation simply re-runs next start */
+          }
+        } catch (err) {
+          console.warn("Forked-subagent token repair failed:", err.message);
+        }
+      })();
+    }, 32_000);
+    if (timer.unref) timer.unref();
+  } catch (err) {
+    console.warn("Forked-subagent token repair could not start:", err.message);
+  }
+}
+
+/**
  * Start the background services the dashboard relies on once the HTTP server
  * is listening: a one-time legacy-session import, the upstream update
  * scheduler, the Claude Code config watcher, and a one-time reconciliation of
@@ -424,6 +1001,31 @@ function startBackgroundServices() {
   // omitted same-model subagents (issues #293 and #345). Marker-gated and
   // deferred; see the function for why live fixes cannot heal every old row.
   repairInflatedTokenTotals();
+
+  // One-time re-split of long-prompt-tier models' buckets by prompt size
+  // (Claude Haiku 5.5); marker-gated and deferred like the repair above.
+  repairLongContextTokenTotals();
+
+  // One-time top-up of sessions to Claude's own saved usage (/compact and
+  // WebFetch calls that leave no transcript message); marker-gated and
+  // deferred like the repairs above.
+  repairCostStateTokenTotals();
+
+  // Second cost-state pass: 1h share for top-up-only cache writes, and records
+  // appended after SessionEnd; marker-gated and deferred like the repairs above.
+  repairCostStateTokenTotalsV2();
+
+  // One-time split of token rows by the Claude Code version that made each
+  // request (version-gated rates); marker-gated and deferred like the above.
+  repairCcVersionTokenSplit();
+
+  // One-time re-split of long-prompt-tier models' cost-state top-ups by
+  // Claude's own cost; marker-gated and deferred like the above.
+  repairLongTierCostSplit();
+
+  // One-time removal of forked subagents' copies of their parent's spawning
+  // message from token totals; marker-gated and deferred like the above.
+  repairForkCopiedUsage();
 
   // Boot liveness reap. When the user quit Claude Code while the dashboard
   // was DOWN, the SessionEnd hook was lost and only the process probe can
@@ -477,6 +1079,25 @@ function startBackgroundServices() {
         })
         .catch((err) => console.warn("subagent token backfill failed:", err?.message || err));
     }, 500);
+    if (t.unref) t.unref();
+  }
+
+  // Backfill each live-recorded Claude session's Claude Code version into its
+  // metadata, so version-gated intro rates (Sonnet 5.5's $0.20 cache read for
+  // Claude Code up to 2.1.295) price by version instead of by date. Deferred,
+  // metadata-only, and self-limiting (each session is looked at once).
+  {
+    const dbModule = require("./db");
+    const { backfillSessionVersions } = require("../scripts/import-history");
+    const t = setTimeout(() => {
+      Promise.resolve()
+        .then(() => backfillSessionVersions(dbModule))
+        .then((r) => {
+          if (r && r.stamped > 0)
+            console.log(`Recorded the Claude Code version for ${r.stamped} session(s)`);
+        })
+        .catch((err) => console.warn("session version backfill failed:", err?.message || err));
+    }, 1_000);
     if (t.unref) t.unref();
   }
 
@@ -1757,4 +2378,9 @@ module.exports = {
   isCodexForeignSessionError,
   startCodexSessionSync,
   repairInflatedTokenTotals,
+  repairLongContextTokenTotals,
+  repairCostStateTokenTotals,
+  repairCcVersionTokenSplit,
+  repairLongTierCostSplit,
+  repairForkCopiedUsage,
 };
