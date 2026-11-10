@@ -74,11 +74,12 @@ const claude = [
   ...["5", "4-8", "4-7", "4-6", "4-5"].map((v) => [`claude-opus-${v}`, 5, 25, 0.5, 6.25, 10]),
   ["claude-opus-4-1", 15, 75, 1.5, 18.75, 30],
   ["claude-opus-4-20250514", 15, 75, 1.5, 18.75, 30],
-  ["claude-sonnet-5-5", 2, 10, 0.2, 2.5, 4],
+  ["claude-sonnet-5-5", 2, 10, 0.1, 2.5, 4],
   ["claude-sonnet-5", 2, 10, 0.2, 2.5, 4],
   ["claude-sonnet-4-6", 3, 15, 0.3, 3.75, 6],
   ["claude-sonnet-4-5", 3, 15, 0.3, 3.75, 6],
   ["claude-sonnet-4-20250514", 3, 15, 0.3, 3.75, 6],
+  ["claude-haiku-5-5", 0.1, 0.5, 0.01, 0.125, 0.2],
   ["claude-haiku-4-5", 1, 5, 0.1, 1.25, 2],
   ["claude-3-5-haiku", 0.8, 4, 0.08, 1, 1.6],
 ];
@@ -112,7 +113,9 @@ describe("published standard prices", () => {
             }),
           ],
           rules,
-          "2026-09-15"
+          // After every dated rate change (Sonnet 5.5 cache reads were cut on
+          // 2026-10-07), so this pins the current published card.
+          "2026-10-07"
         );
         assert.equal(result.total_cost, rates[i], `${model} ${field}`);
         assert.deepEqual(result.unpriced_models || [], []);

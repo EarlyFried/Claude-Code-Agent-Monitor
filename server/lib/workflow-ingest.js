@@ -133,6 +133,12 @@ function mergeWorkflowTokens(dst, src) {
         speed: b.speed,
         geo: b.geo,
         tier: "workflow",
+        // Always the short bucket: workflow rows are rebuilt from run journals
+        // and written with the high-water-mark REPLACE, so re-splitting rows
+        // that already exist by prompt size would fold the old short total
+        // into baseline_* and double-count it. Long-prompt workflow usage
+        // therefore prices at the short card (a documented under-count).
+        ctx: "short",
       };
       for (const f of TOKEN_FIELDS) dst[key][f] = 0;
     }
@@ -474,7 +480,9 @@ async function ingestLiveWorkflow(dbModule, sessionId, sessionDir, runId, script
     const done = doneResults.has(agentId);
     const state = done ? "done" : "running";
     const aTok = parsed ? bucketTotal(parsed.tokensByModel) : 0;
-    const tools = parsed && parsed.toolNames ? parsed.toolNames : [];
+    // parsed.toolNames is a de-duplicated name list (distinct tools); the real
+    // call count is one toolEvent per tool_use block.
+    const tools = parsed && parsed.toolEvents ? parsed.toolEvents : [];
     const startedAt = parsed && parsed.startedAt ? parsed.startedAt : null;
     const endedAt = parsed && parsed.endedAt ? parsed.endedAt : null;
     const durationMs = startedAt && endedAt ? Date.parse(endedAt) - Date.parse(startedAt) : null;
@@ -501,7 +509,7 @@ async function ingestLiveWorkflow(dbModule, sessionId, sessionDir, runId, script
       tokens: aTok,
       toolCalls: tools.length,
       durationMs,
-      lastToolName: tools.length ? tools[tools.length - 1] : null,
+      lastToolName: tools.length ? tools[tools.length - 1].tool_name : null,
       promptPreview: parsed ? parsed.task : null,
       resultPreview: done ? safeStringify(doneResults.get(agentId)) : null,
     });

@@ -10,6 +10,7 @@ const { parseProviders } = require("../lib/provider-filter");
 const scoped = require("../lib/scoped-stats");
 
 const { calculateProviderCost } = require("./pricing");
+const { sessionCcVersionSql, withTokenCcVersion } = require("../lib/pricing-constants");
 
 const router = Router();
 
@@ -66,9 +67,12 @@ router.get("/", (req, res) => {
     ? scoped.scopedTokenUsageWithDate(db, sources, providers)
     : db
         .prepare(
-          "SELECT tu.*, s.provider, DATE(s.started_at) as date FROM token_usage tu JOIN sessions s ON s.id = tu.session_id"
+          `SELECT tu.*, s.provider, DATE(s.started_at) as date,
+                  ${sessionCcVersionSql("s")} as session_cc_version
+           FROM token_usage tu JOIN sessions s ON s.id = tu.session_id`
         )
-        .all();
+        .all()
+        .map(withTokenCcVersion);
 
   const totalCost = calculateProviderCost(
     allTokenUsage,

@@ -17,17 +17,51 @@ const {
   estimateCodeExecHours,
   DATA_RESIDENCY_US_MULTIPLIER,
   BATCH_DISCOUNT_MULTIPLIER,
+  sessionCcVersionSql,
+  tokenCcVersionSql,
 } = require("../lib/pricing-constants");
 
 const router = Router();
 
 const round4 = (n) => Math.round(n * 10000) / 10000;
 
+/** Zeroed per-token-type cost accumulator (USD), shared by every provider calculator. */
+const emptyTypeCosts = () => ({ input: 0, output: 0, cache_read: 0, cache_write: 0 });
+
+/** Round each token-type cost for the response. */
+const roundTypeCosts = (c) => ({
+  input: round4(c.input),
+  output: round4(c.output),
+  cache_read: round4(c.cache_read),
+  cache_write: round4(c.cache_write),
+});
+
 function matchesModelPattern(pattern, model) {
   const expression = String(pattern || "")
     .replace(/[.*+?^${}()|[\]\\]/g, "\\$&")
     .replace(/%/g, ".*");
   return new RegExp(`^${expression}$`, "i").test(String(model || ""));
+}
+
+/**
+ * Whether dotted `version` is at most `cutoff` ("2.1.295" < "2.1.296" <
+ * "2.1.1000"), or null when either is missing or not dotted numbers — the
+ * caller then falls back to deciding by date.
+ */
+function versionAtMost(version, cutoff) {
+  const parse = (v) =>
+    typeof v === "string" && /^\d+(\.\d+)*$/.test(v.trim())
+      ? v.trim().split(".").map(Number)
+      : null;
+  const a = parse(version);
+  const b = parse(cutoff);
+  if (!a || !b) return null;
+  for (let i = 0; i < Math.max(a.length, b.length); i++) {
+    const x = a[i] || 0;
+    const y = b[i] || 0;
+    if (x !== y) return x < y;
+  }
+  return true;
 }
 
 /**
@@ -47,9 +81,14 @@ function ratesForBucket(rule, row, asOf) {
   // historical usage keeps the rate it was billed at and future usage picks up
   // the standard rate), else the caller-provided asOf, else today. Dates are
   // compared as YYYY-MM-DD strings (both intro_until and the daily date use that
-  // shape), so slice any full ISO timestamp to its day.
+  // shape), so slice any full ISO timestamp to its day. A rule with a Claude Code
+  // version cutoff decides by the version that made the requests instead
+  // whenever that is known (`row.cc_version`: the token row's own version, else
+  // the session's recorded one); the date stays the fallback.
   const day = String(row.date || asOf || new Date().toISOString()).slice(0, 10);
-  const useIntro = !!r.intro_until && day <= r.intro_until;
+  const byVersion = versionAtMost(row.cc_version, r.intro_until_version);
+  const useIntro =
+    byVersion !== null ? !!r.intro_until && byVersion : !!r.intro_until && day <= r.intro_until;
   const pick = (introVal, stdVal) => (useIntro && (introVal || 0) > 0 ? introVal : stdVal || 0);
 
   let rIn = pick(r.intro_input_per_mtok, r.input_per_mtok);
@@ -58,6 +97,21 @@ function ratesForBucket(rule, row, asOf) {
   let r5m = pick(r.intro_cache_write_per_mtok, r.cache_write_per_mtok);
   let r1h = pick(r.intro_cache_write_1h_per_mtok, r.cache_write_1h_per_mtok);
 
+  // Long-prompt tier: a request stamped context_size "long" (prompt over the
+  // model's limit, see CLAUDE_LONG_CONTEXT_TIERS) bills at the rule's long
+  // input/output rates, with cache rates scaled by the same factor as the input
+  // base — the derivation fast mode uses below. A rule with no long rates
+  // (0) bills standard. Not combined with fast mode: there is no published card
+  // for that pairing, and the fast branch replaces the base rates when it applies.
+  if (row.context_size === "long" && (r.long_input_per_mtok || 0) > 0) {
+    const baseIn = r.input_per_mtok || 0;
+    const factor = baseIn > 0 ? r.long_input_per_mtok / baseIn : 1;
+    rIn = r.long_input_per_mtok;
+    rOut = (r.long_output_per_mtok || 0) > 0 ? r.long_output_per_mtok : rOut * factor;
+    rRead *= factor;
+    r5m *= factor;
+    r1h *= factor;
+  }
   if (row.speed === "fast" && (r.fast_input_per_mtok || 0) > 0) {
     const baseIn = r.input_per_mtok || 0;
     const factor = baseIn > 0 ? r.fast_input_per_mtok / baseIn : 1;
@@ -99,6 +153,7 @@ function calculateCost(tokenRows, pricingRules, asOf) {
   let tokenCost = 0;
   let webSearchCost = 0;
   let codeExecHours = 0;
+  const typeCosts = emptyTypeCosts();
   // Breakdown is aggregated per (model, speed, geo, tier) tuple, not per input
   // row. This lets callers feed date-split rows (e.g. the daily-usage query,
   // one row per date × model) so each row is priced at its own date's rate,
@@ -132,12 +187,15 @@ function calculateCost(tokenRows, pricingRules, asOf) {
     const { rIn, rOut, rRead, r5m, r1h } = ratesForBucket(rule, row, asOf);
     const cw1h = row.cache_write_1h_tokens || 0;
     const cw5m = Math.max(0, (row.cache_write_tokens || 0) - cw1h);
-    const tCost =
-      (row.input_tokens / 1e6) * rIn +
-      (row.output_tokens / 1e6) * rOut +
-      (row.cache_read_tokens / 1e6) * rRead +
-      (cw5m / 1e6) * r5m +
-      (cw1h / 1e6) * r1h;
+    const inputCost = (row.input_tokens / 1e6) * rIn;
+    const outputCost = (row.output_tokens / 1e6) * rOut;
+    const cacheReadCost = (row.cache_read_tokens / 1e6) * rRead;
+    const cacheWriteCost = (cw5m / 1e6) * r5m + (cw1h / 1e6) * r1h;
+    const tCost = inputCost + outputCost + cacheReadCost + cacheWriteCost;
+    typeCosts.input += inputCost;
+    typeCosts.output += outputCost;
+    typeCosts.cache_read += cacheReadCost;
+    typeCosts.cache_write += cacheWriteCost;
 
     const wsCost = ((row.web_search_requests || 0) / 1000) * WEB_SEARCH_PER_1K_SEARCHES;
     const ceHours = estimateCodeExecHours(
@@ -165,6 +223,7 @@ function calculateCost(tokenRows, pricingRules, asOf) {
       web_fetch_requests: 0,
       code_execution_requests: 0,
       _cost: 0,
+      _types: emptyTypeCosts(),
       matched_rule: rule?.model_pattern || null,
     };
     agg.input_tokens += row.input_tokens || 0;
@@ -176,11 +235,17 @@ function calculateCost(tokenRows, pricingRules, asOf) {
     agg.web_fetch_requests += row.web_fetch_requests || 0;
     agg.code_execution_requests += row.code_execution_requests || 0;
     agg._cost += tCost + wsCost;
+    agg._types.input += inputCost;
+    agg._types.output += outputCost;
+    agg._types.cache_read += cacheReadCost;
+    agg._types.cache_write += cacheWriteCost;
     breakdownMap.set(key, agg);
   }
-  const breakdown = [...breakdownMap.values()].map(({ _cost, ...b }) => ({
+  const breakdown = [...breakdownMap.values()].map(({ _cost, _types, ...b }) => ({
     ...b,
     cost: round4(_cost),
+    cost_exact: _cost,
+    cost_by_type: roundTypeCosts(_types),
   }));
 
   // Code execution is billed by container-time, estimated at the 5-minute
@@ -192,7 +257,10 @@ function calculateCost(tokenRows, pricingRules, asOf) {
 
   return {
     total_cost: round4(total),
+    // Unrounded total, for comparing against Claude Code's own figure exactly.
+    total_cost_exact: total,
     breakdown,
+    cost_by_type: roundTypeCosts(typeCosts),
     feature_costs: {
       web_search_cost: round4(webSearchCost),
       web_fetch_cost: 0,
@@ -217,6 +285,7 @@ function calculateGptCost(tokenRows, pricingRules) {
   );
   const breakdownMap = new Map();
   const unpriced = new Map();
+  const typeCosts = emptyTypeCosts();
   let total = 0;
 
   for (const row of tokenRows) {
@@ -240,12 +309,15 @@ function calculateGptCost(tokenRows, pricingRules) {
     const cached = Number(row.cache_read_tokens) || 0;
     const writes = Number(row.cache_write_tokens) || 0;
     const outputs = Number(row.output_tokens) || 0;
-    const bucketCost = isPriced
-      ? (inputs / 1e6) * rates.input +
-        (cached / 1e6) * rates.cached +
-        (writes / 1e6) * rates.write +
-        (outputs / 1e6) * rates.output
-      : 0;
+    const inputCost = isPriced ? (inputs / 1e6) * rates.input : 0;
+    const cachedCost = isPriced ? (cached / 1e6) * rates.cached : 0;
+    const writeCost = isPriced ? (writes / 1e6) * rates.write : 0;
+    const outputCost = isPriced ? (outputs / 1e6) * rates.output : 0;
+    const bucketCost = inputCost + cachedCost + writeCost + outputCost;
+    typeCosts.input += inputCost;
+    typeCosts.output += outputCost;
+    typeCosts.cache_read += cachedCost;
+    typeCosts.cache_write += writeCost;
     total += bucketCost;
 
     if (!isPriced) {
@@ -286,21 +358,30 @@ function calculateGptCost(tokenRows, pricingRules) {
       code_execution_requests: 0,
       matched_rule: rule?.model_pattern || null,
       _cost: 0,
+      _types: emptyTypeCosts(),
     };
     entry.input_tokens += inputs;
     entry.output_tokens += outputs;
     entry.cache_read_tokens += cached;
     entry.cache_write_tokens += writes;
     entry._cost += bucketCost;
+    entry._types.input += inputCost;
+    entry._types.output += outputCost;
+    entry._types.cache_read += cachedCost;
+    entry._types.cache_write += writeCost;
     breakdownMap.set(key, entry);
   }
 
   return {
     total_cost: round4(total),
-    breakdown: [...breakdownMap.values()].map(({ _cost, ...entry }) => ({
+    total_cost_exact: total,
+    breakdown: [...breakdownMap.values()].map(({ _cost, _types, ...entry }) => ({
       ...entry,
       cost: round4(_cost),
+      cost_exact: _cost,
+      cost_by_type: roundTypeCosts(_types),
     })),
+    cost_by_type: roundTypeCosts(typeCosts),
     feature_costs: {
       web_search_cost: 0,
       web_fetch_cost: 0,
@@ -319,6 +400,7 @@ function calculateCursorCost(tokenRows, pricingRules) {
   );
   const breakdown = [];
   const unpriced = [];
+  const typeCosts = emptyTypeCosts();
   let total = 0;
   for (const row of tokenRows) {
     const model = String(row.model || "unknown");
@@ -330,12 +412,15 @@ function calculateCursorCost(tokenRows, pricingRules) {
     const output = Number(row.output_tokens) || 0;
     const cacheRead = Number(row.cache_read_tokens) || 0;
     const cacheWrite = Number(row.cache_write_tokens) || 0;
-    const cost = rule
-      ? (input / 1e6) * rule.input_per_mtok +
-        (cacheWrite / 1e6) * rule.cache_write_per_mtok +
-        (cacheRead / 1e6) * rule.cache_read_per_mtok +
-        (output / 1e6) * rule.output_per_mtok
-      : 0;
+    const inputCost = rule ? (input / 1e6) * rule.input_per_mtok : 0;
+    const cacheWriteCost = rule ? (cacheWrite / 1e6) * rule.cache_write_per_mtok : 0;
+    const cacheReadCost = rule ? (cacheRead / 1e6) * rule.cache_read_per_mtok : 0;
+    const outputCost = rule ? (output / 1e6) * rule.output_per_mtok : 0;
+    const cost = inputCost + cacheWriteCost + cacheReadCost + outputCost;
+    typeCosts.input += inputCost;
+    typeCosts.output += outputCost;
+    typeCosts.cache_read += cacheReadCost;
+    typeCosts.cache_write += cacheWriteCost;
     total += cost;
     const item = {
       provider: "cursor",
@@ -351,6 +436,13 @@ function calculateCursorCost(tokenRows, pricingRules) {
       code_execution_requests: 0,
       matched_rule: rule?.model_pattern || null,
       cost: round4(cost),
+      cost_exact: cost,
+      cost_by_type: roundTypeCosts({
+        input: inputCost,
+        output: outputCost,
+        cache_read: cacheReadCost,
+        cache_write: cacheWriteCost,
+      }),
     };
     breakdown.push(item);
     if (!rule) {
@@ -368,7 +460,9 @@ function calculateCursorCost(tokenRows, pricingRules) {
   }
   return {
     total_cost: round4(total),
+    total_cost_exact: total,
     breakdown,
+    cost_by_type: roundTypeCosts(typeCosts),
     feature_costs: {
       web_search_cost: 0,
       web_fetch_cost: 0,
@@ -399,7 +493,20 @@ function calculateProviderCost(
 
   return {
     total_cost: round4(claude.total_cost + cursor.total_cost + codex.total_cost),
+    total_cost_exact: claude.total_cost_exact + cursor.total_cost_exact + codex.total_cost_exact,
     breakdown: [...claude.breakdown, ...cursor.breakdown, ...codex.breakdown],
+    cost_by_type: roundTypeCosts({
+      input: claude.cost_by_type.input + cursor.cost_by_type.input + codex.cost_by_type.input,
+      output: claude.cost_by_type.output + cursor.cost_by_type.output + codex.cost_by_type.output,
+      cache_read:
+        claude.cost_by_type.cache_read +
+        cursor.cost_by_type.cache_read +
+        codex.cost_by_type.cache_read,
+      cache_write:
+        claude.cost_by_type.cache_write +
+        cursor.cost_by_type.cache_write +
+        codex.cost_by_type.cache_write,
+    }),
     feature_costs: claude.feature_costs,
     unpriced_models: [
       ...claude.unpriced_models,
@@ -416,6 +523,7 @@ function calculateDailyCosts(dailyTokenRows, pricingRules, gptPricingRules, curs
     rows.push({
       model: row.model,
       provider: row.provider,
+      cc_version: row.cc_version,
       speed: row.speed,
       inference_geo: row.inference_geo,
       service_tier: row.service_tier,
@@ -505,6 +613,10 @@ router.put("/", (req, res) => {
     cache_write_1h_per_mtok,
     fast_input_per_mtok,
     fast_output_per_mtok,
+    // Long-prompt tier rates (optional). A caller that omits both leaves any
+    // stored long tier untouched (see longProvided below).
+    long_input_per_mtok,
+    long_output_per_mtok,
     // Time-limited introductory rates (all optional). A caller that omits every
     // intro field leaves any existing promo untouched (see introProvided below).
     intro_input_per_mtok,
@@ -513,6 +625,9 @@ router.put("/", (req, res) => {
     intro_cache_write_per_mtok,
     intro_cache_write_1h_per_mtok,
     intro_until,
+    // Optional Claude Code version cutoff for the intro rates (e.g. "2.1.295").
+    // Omit to keep the stored value; empty/null clears it.
+    intro_until_version,
   } = req.body;
   if (!model_pattern || !display_name) {
     return res.status(400).json({
@@ -532,6 +647,8 @@ router.put("/", (req, res) => {
     "cache_write_1h_per_mtok",
     "fast_input_per_mtok",
     "fast_output_per_mtok",
+    "long_input_per_mtok",
+    "long_output_per_mtok",
     "intro_input_per_mtok",
     "intro_output_per_mtok",
     "intro_cache_read_per_mtok",
@@ -566,6 +683,11 @@ router.put("/", (req, res) => {
   ];
   const introProvided = introKeys.some((k) => req.body[k] !== undefined);
 
+  // Same backward-compat rule for the long-prompt tier: only touch it when the
+  // caller sent a long_* field, so existing clients never wipe the stored tier.
+  const longProvided =
+    req.body.long_input_per_mtok !== undefined || req.body.long_output_per_mtok !== undefined;
+
   // Normalize / validate intro_until: an empty value clears the promo (NULL);
   // a present value must be a YYYY-MM-DD date so the date-string comparisons in
   // ratesForBucket stay correct.
@@ -582,6 +704,26 @@ router.put("/", (req, res) => {
     }
   }
 
+  // Same rule for the version cutoff: only touch it when sent. A present value
+  // must be dotted numbers so versionAtMost() can compare it.
+  const versionProvided = intro_until_version !== undefined;
+  let normalizedIntroVersion = null;
+  if (versionProvided) {
+    const raw =
+      typeof intro_until_version === "string" ? intro_until_version.trim() : intro_until_version;
+    if (raw) {
+      if (typeof raw !== "string" || !/^\d+(\.\d+)*$/.test(raw)) {
+        return res.status(400).json({
+          error: {
+            code: "INVALID_INPUT",
+            message: "intro_until_version must be a dotted version like 2.1.295",
+          },
+        });
+      }
+      normalizedIntroVersion = raw;
+    }
+  }
+
   const writeRule = db.transaction(() => {
     stmts.upsertPricing.run(
       model_pattern,
@@ -594,6 +736,9 @@ router.put("/", (req, res) => {
       num(fast_input_per_mtok),
       num(fast_output_per_mtok)
     );
+    if (longProvided) {
+      stmts.setLongPricing.run(num(long_input_per_mtok), num(long_output_per_mtok), model_pattern);
+    }
     if (introProvided) {
       // A cleared promo (no date) zeroes the intro rates too so a stale value
       // can't resurface if a date is re-added later without re-entering rates.
@@ -607,6 +752,12 @@ router.put("/", (req, res) => {
         normalizedIntroUntil,
         model_pattern
       );
+    }
+    // A cleared promo clears its version cutoff too, so it cannot outlive the
+    // rates it gates.
+    const promoCleared = introProvided && !normalizedIntroUntil;
+    if (versionProvided || promoCleared) {
+      stmts.setIntroVersion.run(promoCleared ? null : normalizedIntroVersion, model_pattern);
     }
   });
   writeRule();
@@ -723,6 +874,7 @@ router.get("/cost", async (req, res, next) => {
       `SELECT
         DATE(s.started_at, ?) as date,
         s.provider as provider,
+        ${tokenCcVersionSql("tu", "s")} as cc_version,
         tu.model as model,
         tu.speed as speed,
         tu.inference_geo as inference_geo,
@@ -739,7 +891,8 @@ router.get("/cost", async (req, res, next) => {
       FROM token_usage tu
       JOIN sessions s ON s.id = tu.session_id
       ${whereClause}
-      GROUP BY 1, s.provider, tu.model, tu.speed, tu.inference_geo, tu.service_tier, tu.context_size`,
+      GROUP BY 1, s.provider, ${tokenCcVersionSql("tu", "s")}, tu.model, tu.speed, tu.inference_geo,
+        tu.service_tier, tu.context_size`,
       [tzModifier, ...params]
     );
     if (res.destroyed) return;
@@ -762,7 +915,11 @@ router.get("/cost/:sessionId", (req, res) => {
   const sessionId = resolveCursorSessionId(db, req.params.sessionId);
 
   const session = db
-    .prepare("SELECT provider, source, DATE(started_at, ?) as date FROM sessions WHERE id = ?")
+    .prepare(
+      `SELECT provider, source, DATE(started_at, ?) as date,
+        ${sessionCcVersionSql()} as cc_version
+       FROM sessions WHERE id = ?`
+    )
     .get(tzModifier, sessionId);
   if (!session) {
     return res.status(404).json({ error: { code: "NOT_FOUND", message: "Session not found" } });
@@ -775,9 +932,11 @@ router.get("/cost/:sessionId", (req, res) => {
   ) {
     return res.status(404).json({ error: { code: "NOT_FOUND", message: "Session not found" } });
   }
-  const tokenRows = stmts.getTokensBySession
-    .all(sessionId)
-    .map((row) => ({ ...row, provider: session.provider || "claude" }));
+  const tokenRows = stmts.getTokensBySession.all(sessionId).map((row) => ({
+    ...row,
+    provider: session.provider || "claude",
+    cc_version: row.cc_version || session.cc_version,
+  }));
   const rules = stmts.listPricing.all();
   const gptRules = stmts.listGptPricing.all();
   const cursorRules = stmts.listCursorPricing.all();
@@ -796,7 +955,7 @@ router.get("/cost/:sessionId", (req, res) => {
  * their transcript). Priced with the agent's start date so a promo/standard
  * cutover is respected, exactly like session cost.
  */
-function agentOwnCost(agent, pricingRules) {
+function agentOwnCost(agent, pricingRules, ccVersion) {
   if (!agent || !agent.metadata) return 0;
   let meta;
   try {
@@ -807,7 +966,10 @@ function agentOwnCost(agent, pricingRules) {
   const rows = Array.isArray(meta.tokens) ? meta.tokens : null;
   if (!rows || rows.length === 0) return 0;
   const asOf = agent.started_at ? String(agent.started_at).slice(0, 10) : undefined;
-  return calculateCost(rows, pricingRules, asOf).total_cost;
+  // Rows carry the Claude Code version that made the requests; older rows
+  // without one take the session's version (the subagent ran in its process).
+  const priced = rows.map((row) => ({ ...row, cc_version: row.cc_version || ccVersion }));
+  return calculateCost(priced, pricingRules, asOf).total_cost;
 }
 
 /**
@@ -819,7 +981,19 @@ function agentOwnCost(agent, pricingRules) {
 function attachAgentCosts(agents) {
   if (!Array.isArray(agents) || agents.length === 0) return agents;
   const rules = stmts.listPricing.all();
-  return agents.map((a) => ({ ...a, cost: agentOwnCost(a, rules) }));
+  const sessionIds = [...new Set(agents.map((a) => a.session_id).filter(Boolean))];
+  const versions = new Map();
+  for (let i = 0; i < sessionIds.length; i += 900) {
+    const chunk = sessionIds.slice(i, i + 900);
+    const rows = db
+      .prepare(
+        `SELECT id, ${sessionCcVersionSql()} as cc_version FROM sessions
+          WHERE id IN (${chunk.map(() => "?").join(",")})`
+      )
+      .all(...chunk);
+    for (const row of rows) versions.set(row.id, row.cc_version);
+  }
+  return agents.map((a) => ({ ...a, cost: agentOwnCost(a, rules, versions.get(a.session_id)) }));
 }
 
 module.exports = router;

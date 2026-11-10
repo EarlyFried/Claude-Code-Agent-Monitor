@@ -25,7 +25,14 @@ const { ingestWorkflowsForSession } = require("../lib/workflow-ingest");
 const liveness = require("../lib/session-liveness");
 const { getRemotePushToken, extractHeaderOnlyToken, tokensMatch } = require("../lib/security");
 const { REMOTE_PROVIDERS, assertProvider } = require("../lib/remote-sync");
-const { normalizeSpeed, normalizeGeo, normalizeTier } = require("../lib/token-usage");
+const {
+  normalizeSpeed,
+  normalizeGeo,
+  normalizeTier,
+  normalizeCcVersion,
+  writeTokenBuckets,
+} = require("../lib/token-usage");
+const { applyCostState } = require("../lib/cost-state");
 const { isCursorTranscriptPath } = require("../lib/cursor-home");
 const {
   applyCursorTurnUsage,
@@ -86,6 +93,64 @@ function combineLiveSessionTokens(transcriptPath, mainTokensByModel) {
 
   if (parsedSubagents.length === 0) return mainTokensByModel;
   return combineSessionTokens({ tokensByModel: mainTokensByModel, parsedSubagents });
+}
+
+// Delays (ms) after SessionEnd at which the transcript is re-checked for a
+// cost-state record. Claude Code appends it as the process exits, often after
+// the SessionEnd hook has already read the file, so without a later look the
+// session would keep its pre-top-up totals until the next import.
+const LATE_COST_STATE_DELAYS_MS = [2_000, 15_000];
+
+/**
+ * Re-read a just-ended session's transcript (incrementally, through the shared
+ * cache, so the record keeps its per-version split) for its cost-state record
+ * and top the token totals up to it. Fail-safe and unref'd: a missing file or
+ * DB error is ignored, and the timers never keep the process alive. Broadcasts
+ * the session when a top-up changed its totals so open dashboards reprice it.
+ */
+function scheduleLateCostStateCheck(sessionId, transcriptPath) {
+  const apply = db.transaction((costState) => applyCostState(stmts, sessionId, costState));
+  for (const delay of LATE_COST_STATE_DELAYS_MS) {
+    const timer = setTimeout(() => {
+      try {
+        const costState = transcriptCache.extract(transcriptPath)?.costState;
+        if (costState && apply(costState) > 0) {
+          const session = stmts.getSession.get(sessionId);
+          if (session) broadcast("session_updated", session);
+        }
+      } catch {
+        /* best effort — the importer heals any record still missed */
+      }
+    }, delay);
+    if (timer.unref) timer.unref();
+  }
+}
+
+// Last cost-state record each session was topped up to by the hookless
+// transcript reads below. The transcript cache returns the same record object
+// while the file is unchanged, so a repeat watchdog tick skips the DB work.
+const sweptCostState = new Map();
+
+/**
+ * Top a session up to the cost-state record of a transcript read with no hook
+ * behind it (watchdog tick, liveness reap). Claude Code can append the record
+ * after the session's last hook — on exit, or when a conversation continues
+ * in a new session — and a session with no further hooks would otherwise keep
+ * its pre-top-up totals. Broadcasts the session when its totals changed.
+ * Fail-safe: a DB error is ignored, so it never aborts the caller's sweep.
+ */
+function applySweptCostState(sessionId, costState) {
+  if (!costState || sweptCostState.get(sessionId) === costState) return;
+  try {
+    const changed = db.transaction(() => applyCostState(stmts, sessionId, costState))();
+    sweptCostState.set(sessionId, costState);
+    if (changed > 0) {
+      const session = stmts.getSession.get(sessionId);
+      if (session) broadcast("session_updated", session);
+    }
+  } catch {
+    /* best effort — the next tick or hook retries */
+  }
 }
 
 // Stale-session threshold for the SessionStart cleanup pass. Mirrors the
@@ -1046,7 +1111,8 @@ const processEvent = db.transaction((hookType, data, origin = null) => {
   // Extract token usage from transcript on every event that provides transcript_path.
   // Claude Code hooks don't include usage/model in stdin — the main and flat
   // subagent transcript JSONLs are the only reliable source. Uses
-  // replaceTokenUsage with compaction-aware logic:
+  // writeTokenBuckets (replaceTokenUsage's mark, per bucket across its Claude
+  // Code version rows) with compaction-aware logic:
   // when the JSONL total drops (compaction rewrote it), the old value rolls into
   // a baseline column so effective_total = current_jsonl + baseline. This ensures
   // tokens from before compaction are never lost.
@@ -1319,18 +1385,36 @@ const processEvent = db.transaction((hookType, data, origin = null) => {
         }
       }
 
+      // Only a session that has not stored its Claude Code version yet needs a
+      // write for it, so a stored version never adds a metadata (and
+      // updated_at) write on its own.
+      let versionMissing = false;
+      if (result.ccVersion) {
+        try {
+          versionMissing = !JSON.parse(session?.metadata || "{}").version;
+        } catch {
+          versionMissing = false;
+        }
+      }
+
       // Update session metadata with enriched data (thinking blocks, usage extras)
       if (
         result.usageExtras ||
         result.thinkingBlockCount > 0 ||
         reconciledTurnTotals ||
-        insertedTurns > 0
+        insertedTurns > 0 ||
+        versionMissing
       ) {
         const session = stmts.getSession.get(sessionId);
         if (session) {
           const meta = session.metadata ? JSON.parse(session.metadata) : {};
           if (result.usageExtras) {
             meta.usage_extras = result.usageExtras;
+          }
+          // The Claude Code version the session started under (first wins, as
+          // in the importer), used to price version-gated intro rates.
+          if (result.ccVersion && !meta.version) {
+            meta.version = result.ccVersion;
           }
           if (result.thinkingBlockCount > 0) {
             // The cache reports the transcript-wide total, not a per-hook delta.
@@ -1360,32 +1444,28 @@ const processEvent = db.transaction((hookType, data, origin = null) => {
       result?.tokensByModel || null
     );
     if (liveTokensByModel) {
-      // Each bucket carries its pricing dimensions (model/speed/geo/tier) plus
-      // the 1h cache-write split and server-tool request counts.
-      for (const tokens of Object.values(liveTokensByModel)) {
-        stmts.replaceTokenUsage.run(
-          sessionId,
-          tokens.model,
-          tokens.speed,
-          tokens.geo,
-          tokens.tier,
-          tokens.input,
-          tokens.output,
-          tokens.cacheRead,
-          tokens.cacheWrite,
-          tokens.cacheWrite1h,
-          tokens.webSearch,
-          tokens.webFetch,
-          tokens.codeExec
-        );
-      }
+      // Each bucket carries its pricing dimensions (model/speed/geo/tier/ctx
+      // and Claude Code version) plus the 1h cache-write split and server-tool
+      // request counts.
+      writeTokenBuckets(stmts, sessionId, Object.values(liveTokensByModel));
     }
+
+    // Claude's own saved totals (cost-state) include API calls that leave no
+    // assistant message in any transcript — the /compact request and WebFetch's
+    // secondary-model calls. Top the buckets up to those figures; this runs
+    // after the writes above so it sees the freshly replaced totals. Only
+    // raises, never lowers (see server/lib/cost-state.js).
+    if (result?.costState) applyCostState(stmts, sessionId, result.costState);
   }
 
   // Evict transcript from cache on SessionEnd — session is done, no more reads expected.
   // Must happen after token extraction above to avoid re-populating the cache.
   if (hookType === "SessionEnd" && data.transcript_path) {
     transcriptCache.invalidate(data.transcript_path);
+    sweptCostState.delete(sessionId);
+    if (!isCursorTranscriptPath(data.transcript_path)) {
+      scheduleLateCostStateCheck(sessionId, data.transcript_path);
+    }
   }
 
   // A transcript-sync pass exists for the derived data written above (tokens, compactions, turn
@@ -1757,6 +1837,11 @@ async function watchdogTick() {
       const result = transcriptCache.extract(tPath);
       if (!result) continue;
 
+      // A cost-state record written after the last hook (see
+      // applySweptCostState) — the watchdog is the only reader of an idle
+      // session's transcript.
+      applySweptCostState(sess.id, result.costState);
+
       // Pick up a /rename or fresh ai-title even when no hook fired for it —
       // a session left idle right after /rename has no further events, so the
       // watchdog is the path that surfaces the new name within ~15s. The
@@ -2093,6 +2178,13 @@ function livenessReap({
       }
       if (!lastActivityMs) lastActivityMs = Date.parse(sess.updated_at) || 0;
       if (now - lastActivityMs < LIVENESS_IDLE_MS) continue;
+    }
+
+    // Claude Code saves the session's cost-state as it exits, after its last
+    // hook; with no SessionEnd there is no late check, so read it here.
+    if (provider === "claude" && sess.transcript_path) {
+      applySweptCostState(sess.id, transcriptCache.extract(sess.transcript_path)?.costState);
+      sweptCostState.delete(sess.id);
     }
 
     // Mirror the SessionEnd case: all DB writes first, then broadcasts.
@@ -2449,12 +2541,18 @@ router.post("/ingest-batch", (req, res) => {
       // never store a raw client-supplied value. Note this route mirrors the
       // local hook's cumulative-per-bucket-totals contract: each tokens[]
       // entry is the bucket's FULL current total (like a transcript re-parse),
-      // not a delta — replaceTokenUsage below is a high-water-mark REPLACE,
+      // not a delta — writeTokenBuckets below is a high-water-mark REPLACE,
       // not an additive upsert, so a client sending deltas would silently
       // under-count.
       speed: normalizeSpeed({ speed: t.speed }),
       geo: normalizeGeo({ inference_geo: t.inference_geo }),
       tier: normalizeTier({ service_tier: t.service_tier }),
+      // Optional prompt-size class for models with a long-prompt rate tier.
+      // Pushers that predate it omit the field and stay "short".
+      ctx: t.context_size === "long" ? "long" : "short",
+      // Optional Claude Code version that made the requests; absent or not a
+      // dotted number, the bucket prices by the session's version.
+      ccVersion: normalizeCcVersion(t.cc_version),
       ...values,
     });
   });
@@ -2606,23 +2704,10 @@ router.post("/ingest-batch", (req, res) => {
       if (mainAgent) pendingBroadcasts.push(["agent_created", mainAgent]);
     }
 
-    for (const tk of validTokens) {
-      stmts.replaceTokenUsage.run(
-        sessionId,
-        tk.model,
-        tk.speed,
-        tk.geo,
-        tk.tier,
-        tk.input,
-        tk.output,
-        tk.cacheRead,
-        tk.cacheWrite,
-        tk.cacheWrite1h,
-        tk.webSearch,
-        tk.webFetch,
-        tk.codeExec
-      );
-    }
+    // Same writer as the transcript paths, so a session that is both pushed
+    // here and synced through ingest-transcript keeps one high-water mark per
+    // bucket across its Claude Code version rows.
+    if (validTokens.length > 0) writeTokenBuckets(stmts, sessionId, validTokens);
 
     for (const ev of validToolEvents) {
       const ts = ev.timestamp || new Date().toISOString();

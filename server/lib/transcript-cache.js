@@ -7,6 +7,8 @@
 
 const fs = require("fs");
 const {
+  contextSizeFor,
+  normalizeCcVersion,
   bucketKey,
   emptyBucket,
   extractUsageFields,
@@ -16,7 +18,14 @@ const {
   accumulateBucket,
   subtractBucket,
   rememberUsageContribution,
+  isInheritedForkRecord,
 } = require("./token-usage");
+const {
+  parseCostStateEntry,
+  newCostStateTracker,
+  trackEntryVersion,
+  trackCostState,
+} = require("./cost-state");
 
 const MAX_CACHE_ENTRIES = 200;
 
@@ -176,7 +185,8 @@ class TranscriptCache {
           transcriptPath,
           cached.bytesRead,
           stat.size,
-          cached.result?.usageByMessageId
+          cached.result?.usageByMessageId,
+          cached.result?.costStateTracker
         );
         if (incremental) {
           const merged = this._merge(cached, incremental);
@@ -198,9 +208,12 @@ class TranscriptCache {
             usageExtras: hasUsageExtras ? merged.usageExtras : null,
             usageByMessageId: merged.usageByMessageId || null,
             latestModel: merged.latestModel || null,
+            costState: merged.costState || null,
+            costStateTracker: merged.costStateTracker || null,
             customTitle: merged.customTitle || null,
             aiTitle: merged.aiTitle || null,
             firstUserMessage: merged.firstUserMessage || null,
+            ccVersion: merged.ccVersion || null,
             recentUserMessages: merged.recentUserMessages || [],
             lastInterruptTs: merged.lastInterruptTs || null,
             lastTurnTs: merged.lastTurnTs || null,
@@ -214,9 +227,11 @@ class TranscriptCache {
             !result.thinkingBlockCount &&
             !result.usageExtras &&
             !result.latestModel &&
+            !result.costState &&
             !result.customTitle &&
             !result.aiTitle &&
             !result.firstUserMessage &&
+            !result.ccVersion &&
             result.recentUserMessages.length === 0 &&
             !result.lastInterruptTs &&
             !result.lastTurnTs
@@ -287,8 +302,8 @@ class TranscriptCache {
    * straddling a chunk boundary are not corrupted. Never builds a string
    * larger than a single line, so V8 string-length limits cannot be hit.
    */
-  _streamRange(filePath, startOffset, endOffset, usageByMessageId) {
-    const state = this._initParseState(usageByMessageId);
+  _streamRange(filePath, startOffset, endOffset, usageByMessageId, costStateTracker) {
+    const state = this._initParseState(usageByMessageId, costStateTracker);
     if (endOffset <= startOffset) return this._finalizeState(state);
 
     const CHUNK = 4 * 1024 * 1024; // 4 MiB
@@ -388,7 +403,7 @@ class TranscriptCache {
     return this._finalizeState(state);
   }
 
-  _initParseState(usageByMessageId) {
+  _initParseState(usageByMessageId, costStateTracker) {
     return {
       tokensByModel: {},
       // Claude Code writes one JSONL record per content block, so a single
@@ -418,6 +433,21 @@ class TranscriptCache {
       // the user's *current* model — used downstream to keep session.model in
       // sync when the user invokes /model mid-session.
       latestModel: null,
+      // Claude's own running per-model token totals (the `cost-state` entry it
+      // appends when it saves the session cost). Append-only, last wins. It is
+      // the only record of API calls that leave no assistant message — see
+      // server/lib/cost-state.js.
+      costState: null,
+      // Which Claude Code version wrote each cost-state increase (see
+      // trackCostState). Seeded from the cached result on incremental reads,
+      // since the split depends on every earlier record and version.
+      costStateTracker: costStateTracker
+        ? JSON.parse(JSON.stringify(costStateTracker))
+        : newCostStateTracker(),
+      // The Claude Code version of the first entry that carries one (`version`
+      // on user/assistant/system lines). First wins; prices version-gated
+      // intro rates (see ratesForBucket in server/routes/pricing.js).
+      ccVersion: null,
       // Track the latest human-readable session title. Two sources, both
       // append-only metadata lines: `custom-title` (explicit /rename, claude
       // -n, picker Ctrl+R) and `ai-title` (auto-generated / plan-accept).
@@ -457,12 +487,22 @@ class TranscriptCache {
       return;
     }
 
+    if (!state.ccVersion && typeof entry.version === "string" && entry.version) {
+      state.ccVersion = entry.version;
+    }
+    trackEntryVersion(state.costStateTracker, entry);
+
     // Session title metadata lines — sparse, no usage payload. Capture the
     // latest value of each kind (append-only → last wins) and bail early.
     if (entry.type === "custom-title") {
       if (typeof entry.customTitle === "string" && entry.customTitle.trim()) {
         state.customTitle = entry.customTitle;
       }
+      return;
+    }
+    if (entry.type === "cost-state") {
+      const costState = parseCostStateEntry(entry);
+      if (costState) state.costState = trackCostState(state.costStateTracker, costState);
       return;
     }
     if (entry.type === "ai-title") {
@@ -566,6 +606,8 @@ class TranscriptCache {
 
     const model = msg.model;
     if (!model || model === "<synthetic>" || !msg.usage) return;
+    // A fork's copy of its parent's spawning message — counted in the parent.
+    if (isInheritedForkRecord(entry)) return;
     state.latestModel = model;
     // Bucket tokens by the pricing dimensions (speed / geo / tier) so cost can
     // apply fast-mode, data-residency, and Batch modifiers per bucket. The value
@@ -579,7 +621,15 @@ class TranscriptCache {
     const speed = normalizeSpeed(msg.usage);
     const geo = normalizeGeo(msg.usage);
     const tier = normalizeTier(msg.usage);
-    const key = bucketKey(model, speed, geo, tier);
+    const fields = extractUsageFields(msg.usage);
+    // Prompt-size class (long-prompt rate tier). Derived per record, so a
+    // message whose partial usage was "short" and whose final usage is "long"
+    // is retracted from the old bucket and counted in the new one below.
+    const ctx = contextSizeFor(model, fields);
+    // The Claude Code version that made this request — a resumed session can
+    // span releases, and version-gated rates price each message by its own.
+    const ccVersion = normalizeCcVersion(entry.version);
+    const key = bucketKey(model, speed, geo, tier, ctx, ccVersion);
     if (usageMsgId) {
       const prev = state.usageByMessageId.get(usageMsgId);
       if (prev) {
@@ -587,15 +637,21 @@ class TranscriptCache {
         // exists in the cached result of a previous incremental parse; a
         // transiently negative local bucket nets out at merge time.
         if (!state.tokensByModel[prev.key]) {
-          state.tokensByModel[prev.key] = emptyBucket(prev.model, prev.speed, prev.geo, prev.tier);
+          state.tokensByModel[prev.key] = emptyBucket(
+            prev.model,
+            prev.speed,
+            prev.geo,
+            prev.tier,
+            prev.ctx,
+            prev.ccVersion
+          );
         }
         subtractBucket(state.tokensByModel[prev.key], prev.fields);
       }
     }
     if (!state.tokensByModel[key]) {
-      state.tokensByModel[key] = emptyBucket(model, speed, geo, tier);
+      state.tokensByModel[key] = emptyBucket(model, speed, geo, tier, ctx, ccVersion);
     }
-    const fields = extractUsageFields(msg.usage);
     accumulateBucket(state.tokensByModel[key], fields);
     if (usageMsgId) {
       // Bounded tail window (see rememberUsageContribution) — a message's
@@ -604,7 +660,7 @@ class TranscriptCache {
       rememberUsageContribution(
         state.usageByMessageId,
         usageMsgId,
-        { key, model, speed, geo, tier, fields },
+        { key, model, speed, geo, tier, ctx, ccVersion, fields },
         MAX_ARRAY_LEN
       );
     }
@@ -639,9 +695,11 @@ class TranscriptCache {
       !state.thinkingBlockCount &&
       !hasUsageExtras &&
       !state.latestModel &&
+      !state.costState &&
       !state.customTitle &&
       !state.aiTitle &&
       !state.firstUserMessage &&
+      !state.ccVersion &&
       state.recentUserMessages.length === 0 &&
       !state.lastInterruptTs &&
       !state.lastTurnTs
@@ -679,9 +737,12 @@ class TranscriptCache {
         ? this._capArrayFromSet(state.usageByMessageId.entries())
         : null,
       latestModel: state.latestModel,
+      costState: state.costState,
+      costStateTracker: state.costStateTracker,
       customTitle: state.customTitle,
       aiTitle: state.aiTitle,
       firstUserMessage: state.firstUserMessage,
+      ccVersion: state.ccVersion,
       recentUserMessages: state.recentUserMessages,
       lastInterruptTs: state.lastInterruptTs,
       lastTurnTs: state.lastTurnTs,
@@ -719,7 +780,14 @@ class TranscriptCache {
     if (incremental && incremental.tokensByModel) {
       for (const [key, tokens] of Object.entries(incremental.tokensByModel)) {
         if (!tokensByModel[key]) {
-          tokensByModel[key] = emptyBucket(tokens.model, tokens.speed, tokens.geo, tokens.tier);
+          tokensByModel[key] = emptyBucket(
+            tokens.model,
+            tokens.speed,
+            tokens.geo,
+            tokens.tier,
+            tokens.ctx,
+            tokens.ccVersion
+          );
         }
         accumulateBucket(tokensByModel[key], tokens);
       }
@@ -792,6 +860,14 @@ class TranscriptCache {
     const latestModel =
       (incremental && incremental.latestModel) || cached.result?.latestModel || null;
 
+    // Append-only, last wins: a newer cost-state record is cumulative and
+    // supersedes the cached one.
+    const costState = (incremental && incremental.costState) || cached.result?.costState || null;
+    // The incremental read was seeded with the cached tracker, so its copy is
+    // the newest; a chunk that parsed to nothing keeps the cached one.
+    const costStateTracker =
+      (incremental && incremental.costStateTracker) || cached.result?.costStateTracker || null;
+
     // Same append-only logic for the session titles: the newest title line in
     // the incremental chunk wins, else keep what was cached.
     const customTitle =
@@ -803,6 +879,10 @@ class TranscriptCache {
     // incremental chunk only fills it when nothing was captured before.
     const firstUserMessage =
       cached.result?.firstUserMessage || (incremental && incremental.firstUserMessage) || null;
+
+    // The Claude Code version is first-wins too: it records the version the
+    // session started under, mirroring how its start date prices dated rates.
+    const ccVersion = cached.result?.ccVersion || (incremental && incremental.ccVersion) || null;
 
     // Both arrays are chronological and already bounded to two entries. Fold
     // them through the same distinctness rule so an appended duplicate does
@@ -839,9 +919,12 @@ class TranscriptCache {
       usageExtras,
       usageByMessageId,
       latestModel,
+      costState,
+      costStateTracker,
       customTitle,
       aiTitle,
       firstUserMessage,
+      ccVersion,
       recentUserMessages,
       lastInterruptTs,
       lastTurnTs,

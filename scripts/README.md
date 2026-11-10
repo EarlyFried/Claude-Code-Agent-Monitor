@@ -32,9 +32,11 @@ Hook behavior is documented in [`docs/HOOKS.md`](../docs/HOOKS.md). Any change h
 | `cost-snapshot.js`  | —                            | `node scripts/cost-snapshot.js snapshot --out f.tsv` writes a per-session source/usage/cost TSV from the database opened read-only; `node scripts/cost-snapshot.js compare before.tsv after.tsv` splits local vs remote changes. `--fail-on-local-change` exits 1 when a local session's input, output, cache-read, cache-write, one-hour cache-write, web-search, web-fetch, code-execution, or cost changes; ownership moves to or from local; or a local session is removed. Remote and newly added sessions are reported separately; an incomplete or non-numeric row is refused. Take one before an upgrade that recounts usage at startup. |
 | `seed.js`           | `npm run seed`               | Additive, idempotent fixtures for development. `--full` adds random demo sessions; `--reset` refreshes only fixture rows. Never deletes user data. |
 | `clear-data.js`     | `npm run clear-data`         | **Destructive.** Dry run by default (prints counts). `--yes` wipes sessions/agents/events/token usage; `--backup` snapshots the DB to `data/backups/` first; `--demo-only --yes` removes only seed fixtures. |
+| `compare-claude-cost.js` | `npm run compare-cost`  | Read-only. Lists every Claude session whose dashboard cost differs from Claude Code's own figure (the transcript's last `cost-state` `totalCostUSD`, else `~/.claude.json` `lastCost`). Compares unrounded figures (the dashboard's `total_cost_exact`) and prints 6 decimals; differences under $1e-9 count as equal. Needs the dashboard running. Flags: `--threshold <usd>` (default `0`, every difference), `--models` (per-model breakdown), `--json`, `--server <url>` (default `CCAM_URL` or `http://127.0.0.1:4820`). Exits `1` when any session differs. `compare-claude-cost.sh` is a wrapper that runs it from any directory. |
 
 ```bash
 npm run import-history -- --dry-run
+npm run compare-cost -- --models --threshold 0.10
 npm run seed
 npm run clear-data                    # dry run
 npm run clear-data -- --yes --backup  # irrevocable, with backup

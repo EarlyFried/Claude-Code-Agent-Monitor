@@ -255,7 +255,7 @@ import { Select } from "../components/Select";
 import { useUrlTab } from "../hooks/usePageShortcuts";
 import { usePaletteAction } from "../components/PaletteActionProvider";
 import { PaletteHint } from "../components/PaletteHint";
-import { formatDateTime, formatDuration, truncate, fmtCost } from "../lib/format";
+import { formatDateTime, formatDuration, promptPwd, fmtCost, fmt } from "../lib/format";
 import {
   effectiveSessionStatus,
   isSessionAwaitingInput,
@@ -265,8 +265,8 @@ import type { Session, DashboardEvent } from "../lib/types";
 
 /** Sessions per page. */
 const PAGE_SIZE = 10;
-/** Sort column sent to the server: start time, duration, or cost. */
-type SessionSort = "time" | "duration" | "price";
+/** Sort column sent to the server: start time, duration, cost, or total tokens. */
+type SessionSort = "time" | "duration" | "price" | "tokens";
 
 /**
  * Whether a row is a transient placeholder for a Codex TUI process that has not written a session
@@ -439,6 +439,7 @@ export function Sessions() {
   usePaletteAction("sessions.sortTime", () => setSortBy("time"));
   usePaletteAction("sessions.sortDuration", () => setSortBy("duration"));
   usePaletteAction("sessions.sortCost", () => setSortBy("price"));
+  usePaletteAction("sessions.sortTokens", () => setSortBy("tokens"));
   usePaletteAction("sessions.toggleSortDirection", () => setSortDesc((prev) => !prev));
   usePaletteAction("sessions.clearFilters", () => {
     setFilter("");
@@ -548,6 +549,7 @@ export function Sessions() {
     { label: t(sortDesc ? "sortTimeNewest" : "sortTimeOldest"), value: "time" },
     { label: t(sortDesc ? "sortDurationLongest" : "sortDurationShortest"), value: "duration" },
     { label: t(sortDesc ? "sortPriceHighest" : "sortPriceLowest"), value: "price" },
+    { label: t(sortDesc ? "sortTokensHighest" : "sortTokensLowest"), value: "tokens" },
   ];
 
   return (
@@ -704,6 +706,9 @@ export function Sessions() {
                     {t("tableCost")}
                   </th>
                   <th className="px-5 py-3 text-[11px] font-semibold text-gray-500 uppercase tracking-wider">
+                    {t("tableTokens")}
+                  </th>
+                  <th className="px-5 py-3 text-[11px] font-semibold text-gray-500 uppercase tracking-wider">
                     {t("tableDirectory")}
                   </th>
                   <th className="w-10"></th>
@@ -714,8 +719,18 @@ export function Sessions() {
                   ? Array.from({ length: 8 }).map((_, i) => (
                       <TableRowSkeleton
                         key={`sk-${i}`}
-                        columns={8}
-                        widths={["w-40", "w-20", "w-28", "w-20", "w-10", "w-16", "w-44", "w-4"]}
+                        columns={9}
+                        widths={[
+                          "w-40",
+                          "w-20",
+                          "w-28",
+                          "w-20",
+                          "w-10",
+                          "w-16",
+                          "w-16",
+                          "w-44",
+                          "w-4",
+                        ]}
                       />
                     ))
                   : null}
@@ -792,10 +807,18 @@ export function Sessions() {
                       {session.cost != null && session.cost > 0 ? fmtCost(session.cost) : "-"}
                     </td>
                     <td
-                      className="px-5 py-4 text-[11px] text-gray-500 font-mono"
+                      className="px-5 py-4 text-sm text-gray-400 font-mono"
+                      title={
+                        session.total_tokens ? session.total_tokens.toLocaleString() : undefined
+                      }
+                    >
+                      {session.total_tokens ? fmt(session.total_tokens) : "-"}
+                    </td>
+                    <td
+                      className="px-5 py-4 text-[11px] text-gray-500 font-mono w-[22%] max-w-0"
                       title={session.cwd || undefined}
                     >
-                      {session.cwd ? truncate(session.cwd, 30) : "-"}
+                      <div className="truncate">{session.cwd ? promptPwd(session.cwd) : "-"}</div>
                     </td>
                     <td className="px-3 py-4">
                       {!isTransientProcessSession(session) && (

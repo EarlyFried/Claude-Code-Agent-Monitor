@@ -152,7 +152,7 @@ returns the same optional field.
 | `status` | string | - | Filter by persisted status: `active`, `completed`, `error`, `abandoned`. The UI **Waiting** state is derived from the `awaiting_input_since` column and is not a queryable enum — filter `status=active` and inspect `awaiting_input_since` (non-null = Waiting) |
 | `q` | string | - | Case-insensitive search across `id`, `name`, and `cwd` |
 | `cwd` | string (repeatable) | - | Exact working directory filter. Repeat it to include multiple projects, for example `cwd=/work/a&cwd=/work/b` |
-| `sort_by` | string | `time` | Ordering dimension: `time`, `duration`, or `price` |
+| `sort_by` | string | `time` | Ordering dimension: `time`, `duration`, `price` (cost), or `tokens` (total tokens consumed) |
 | `sort_desc` | boolean | `true` | Use descending order; set to `false` for ascending order |
 | `sources` | string | - | Comma-separated data-source ids to include (the built-in local history is `local`; remote SSH machines use their `remote_sources.id`). Omit for all sources. Also accepted on `/api/events`, `/api/agents`, `/api/stats`, `/api/analytics`, and `/api/pricing/cost`. See [Remote Data Sources](#remote-data-sources) |
 | `providers` | string | - | Comma-separated product providers: `claude`, `codex`, or both. It composes with `sources` and is accepted by the scoped list, aggregate, facet, per-session detail, cost, and workflow routes. Codex workflow responses include its recorded `response_item` tool calls, token/model totals, and `context_compacted` events; only Claude Code's Workflow-tool run journals are unavailable for Codex. |
@@ -820,12 +820,16 @@ Upsert a pricing rule, keyed by `model_pattern`. The same call creates a new rul
 | `input_per_mtok` / `output_per_mtok` | number | Standard per-MTok rates (default 0) |
 | `cache_read_per_mtok` / `cache_write_per_mtok` / `cache_write_1h_per_mtok` | number | Cache rates (default 0) |
 | `fast_input_per_mtok` / `fast_output_per_mtok` | number | Fast-mode premium rates (default 0) |
+| `long_input_per_mtok` / `long_output_per_mtok` | number | Long-prompt tier rates (0 = no long tier). Applied to usage stamped `context_size: "long"`; the cache rates scale with the long input base (so Haiku 5.5's $0.50 long input prices cache reads at $0.05, 5m writes at $0.625, 1h writes at $1). **Optional:** omitted fields keep the stored values |
 | `intro_until` | string \| null | Optional promo cutoff `YYYY-MM-DD`. Usage **on or before** this date is priced at the `intro_*` rates, after it at the standard rates. Empty/`null` clears the promo (and zeroes the intro rates) |
 | `intro_*_per_mtok` | number | Optional introductory (promo) rates, mirroring the standard fields |
+| `intro_until_version` | string \| null | Optional Claude Code version cutoff (dotted numbers, e.g. `2.1.295`). When set and the Claude Code version that made the requests is known (recorded per request; older usage uses the session's recorded version), usage from that version or older is priced at the `intro_*` rates instead of deciding by `intro_until`; usage with no known version still uses the date. Omit to keep the stored value; empty/`null` clears it, and clearing the promo clears it too |
 
-The intro block is **optional and backward-compatible**: a request that omits every `intro_*`/`intro_until` field leaves any existing promo untouched, so older clients that send only the standard rates never clobber a promo.
+The intro block is **optional and backward-compatible**: a request that omits every `intro_*`/`intro_until` field leaves any existing promo untouched, so older clients that send only the standard rates never clobber a promo. The long-prompt tier follows the same rule: a request that omits both `long_*` fields leaves the stored tier untouched.
 
-**Validation:** every `*_per_mtok` rate present in the body must be a **non-negative finite number** (numeric strings are coerced); a `NaN`, non-numeric, or negative value is rejected with `400 INVALID_INPUT` naming the offending field, and nothing is written. `intro_until` must be a `YYYY-MM-DD` date (or empty/`null` to clear the promo).
+**Long-prompt tier.** Some models bill a higher rate once a single request's prompt (fresh input + cache reads + cache writes) exceeds a limit. Ingestion stamps each such request `context_size: "long"` and every other request `"short"`; the limits live in `CLAUDE_LONG_CONTEXT_TIERS` in `server/lib/pricing-constants.js` (today only `claude-haiku-5-5`: $0.10/$0.50 up to 100K prompt tokens, $0.50/$2.50 above). A rule with no long rates bills long requests at its standard rates. Workflow-fleet usage (`service_tier: "workflow"`) is never split, so it prices at the short card.
+
+**Validation:** every `*_per_mtok` rate present in the body must be a **non-negative finite number** (numeric strings are coerced); a `NaN`, non-numeric, or negative value is rejected with `400 INVALID_INPUT` naming the offending field, and nothing is written. `intro_until` must be a `YYYY-MM-DD` date (or empty/`null` to clear the promo); `intro_until_version` must be dotted numbers (or empty/`null` to clear it).
 
 **Example Request:**
 
@@ -859,7 +863,7 @@ curl -X PUT http://localhost:4820/api/pricing \
 
 | Code | Description |
 |------|-------------|
-| 400 | Missing `model_pattern`/`display_name`, or `intro_until` not a `YYYY-MM-DD` date |
+| 400 | Missing `model_pattern`/`display_name`, `intro_until` not a `YYYY-MM-DD` date, or `intro_until_version` not a dotted version |
 | 500 | Database error |
 
 ---
@@ -981,10 +985,23 @@ GET /api/pricing/cost
 GET /api/pricing/cost/:sessionId
 ```
 
-The response contains `total_cost`, `breakdown`, `daily_costs`, feature surcharges, and
-`unpriced_models`. Each unpriced entry includes `provider` (`claude`, `cursor`, or `codex`) so a
-client can link the missing rate to the correct Settings editor; its tokens contribute $0 until a
-matching rule exists.
+Prices token usage against the pricing rules: every session, or one session. Both return `total_cost`, a per-bucket `breakdown` (each with `cost`), `cost_by_type`, `feature_costs`, `unpriced_models`, and `daily_costs`. Costs are rounded to 4 decimals. `total_cost_exact` and each breakdown entry's `cost_exact` carry the same figures unrounded, for exact comparison with Claude Code's own `cost-state` total (`scripts/compare-claude-cost.js` uses them).
+
+Each `unpriced_models` entry includes `provider` (`claude`, `cursor`, or `codex`) so a client can link
+the missing rate to the correct Settings editor; its tokens contribute $0 until a matching rule exists.
+
+```bash
+curl http://localhost:4820/api/pricing/cost/<session-id>
+```
+
+```json
+{
+  "total_cost": 0.3579,
+  "total_cost_exact": 0.35788125,
+  "breakdown": [{ "model": "claude-sonnet-5-5", "cost": 0.3579, "cost_exact": 0.35788125 }],
+  "daily_costs": [{ "date": "2026-10-20", "cost": 0.3579 }]
+}
+```
 
 ---
 
@@ -1306,7 +1323,7 @@ and proxy logs. `ingest-transcript` verifies this header before reading its larg
 | `cwd` | string | No | Working directory on the pushing machine |
 | `repo_remote_url` | string | No | Optional collector Git remote; URL/SCP userinfo, query strings, and fragments are removed, malformed URL-style values are discarded, and the first non-empty sanitized value wins |
 | `model` | string | No | Model id for the session |
-| `tokens` | array | No | Each entry is that bucket's **full current total** (like a transcript re-parse), **not** a delta |
+| `tokens` | array | No | Each entry is that bucket's **full current total** (like a transcript re-parse), **not** a delta. An entry may carry `context_size` (`"short"` default, or `"long"` for a long-prompt-tier model's over-limit requests); pushers that omit it land in the short bucket. An entry may also carry `cc_version` (the Claude Code version that made those requests, e.g. `"2.1.296"`) so version-gated rates price it by that version; without one it is unsplit and priced by the session's version. A push never lowers what a version row already holds |
 | `tool_events` | array | No | Tool calls, stored as `RemoteToolEvent` events |
 | `turns` | array | No | Turn durations, stored as `RemoteTurn` events |
 

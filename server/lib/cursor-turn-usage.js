@@ -136,6 +136,7 @@ function rewriteCursorTokenBuckets(stmts, sessionId, previousBucket = null) {
       bucket.speed,
       "global",
       "standard",
+      "short",
       bucket.input_tokens,
       bucket.output_tokens,
       bucket.cache_read_tokens,

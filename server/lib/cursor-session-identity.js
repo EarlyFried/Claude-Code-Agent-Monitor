@@ -60,21 +60,21 @@ function mainAgent(db, sessionId) {
 function mergeLegacyTokenUsage(db, aliasId, canonicalId) {
   db.prepare(
     `INSERT INTO token_usage (
-       session_id, model, speed, inference_geo, service_tier, context_size,
+       session_id, model, speed, inference_geo, service_tier, context_size, cc_version,
        input_tokens, output_tokens, cache_read_tokens, cache_write_tokens,
        cache_write_1h_tokens, web_search_requests, web_fetch_requests,
        code_execution_requests, baseline_input, baseline_output,
        baseline_cache_read, baseline_cache_write, baseline_cache_write_1h,
        baseline_web_search, baseline_web_fetch, baseline_code_execution
      )
-     SELECT ?, model, speed, inference_geo, service_tier, context_size,
+     SELECT ?, model, speed, inference_geo, service_tier, context_size, cc_version,
        input_tokens, output_tokens, cache_read_tokens, cache_write_tokens,
        cache_write_1h_tokens, web_search_requests, web_fetch_requests,
        code_execution_requests, baseline_input, baseline_output,
        baseline_cache_read, baseline_cache_write, baseline_cache_write_1h,
        baseline_web_search, baseline_web_fetch, baseline_code_execution
      FROM token_usage WHERE session_id = ?
-     ON CONFLICT(session_id, model, speed, inference_geo, service_tier, context_size)
+     ON CONFLICT(session_id, model, speed, inference_geo, service_tier, context_size, cc_version)
      DO UPDATE SET
        input_tokens = MAX(input_tokens, excluded.input_tokens),
        output_tokens = MAX(output_tokens, excluded.output_tokens),

@@ -51,6 +51,7 @@ const PRICING_RULE_EXAMPLE_2 = {
 /** A full CostResult-shaped example body returned by both cost endpoints. */
 const COST_RESULT_EXAMPLE = {
   total_cost: 12.8431,
+  total_cost_exact: 12.84306875,
   breakdown: [
     {
       model: "claude-opus-4-8",
@@ -66,6 +67,7 @@ const COST_RESULT_EXAMPLE = {
       web_fetch_requests: 3,
       code_execution_requests: 2,
       cost: 8.4127,
+      cost_exact: 8.41266,
       matched_rule: "claude-opus-4%",
     },
     {
@@ -82,6 +84,7 @@ const COST_RESULT_EXAMPLE = {
       web_fetch_requests: 0,
       code_execution_requests: 0,
       cost: 1.5904,
+      cost_exact: 1.59040875,
       matched_rule: "claude-haiku%",
     },
   ],
@@ -192,6 +195,10 @@ module.exports = {
           "to match a model family (e.g. `claude-opus-4%`). Set " +
           "`fast_input_per_mtok` / `fast_output_per_mtok` only if the model bills " +
           "fast-mode usage at a premium; leave them 0 otherwise. " +
+          "`long_input_per_mtok` / `long_output_per_mtok` set the long-prompt " +
+          "tier (requests whose prompt exceeds the model's limit, e.g. Claude " +
+          "Haiku 5.5 over 100K tokens; cache rates scale with the long input " +
+          "base) and, unlike the other rates, are kept when omitted. " +
           "Note the asymmetry with the list endpoint: the response wraps a SINGLE " +
           "stored rule as `{ pricing: <rule> }` (not an array). A missing " +
           "`model_pattern` or `display_name` returns 400 `INVALID_INPUT`, and so " +
@@ -301,8 +308,9 @@ module.exports = {
         operationId: "getTotalCost",
         description:
           "Computes the aggregate token cost across EVERY session by matching " +
-          "each (model, speed, inference_geo, service_tier) usage bucket against " +
-          "the most specific pricing rule. Returns `total_cost`, a per-bucket " +
+          "each (model, speed, inference_geo, service_tier, context_size) usage bucket against " +
+          "the most specific pricing rule. Returns `total_cost` (rounded to 4 " +
+          "decimals; `total_cost_exact` is the unrounded figure), a per-bucket " +
           "`breakdown`, `feature_costs` (web-search surcharge, code-execution " +
           "container time with the org free-hours allowance applied), " +
           "`unpriced_models` (usage with no matching rule, contributing $0 so the " +
@@ -358,7 +366,7 @@ module.exports = {
         description:
           "Same cost computation as `/api/pricing/cost`, but scoped to a single " +
           "session's token usage. Returns the identical `CostResult` shape " +
-          "(`total_cost`, `breakdown`, `feature_costs`, `unpriced_models`, " +
+          "(`total_cost`, `total_cost_exact`, `breakdown`, `feature_costs`, `unpriced_models`, " +
           "`daily_costs`); `daily_costs` holds at most one entry — the session's " +
           "start date in the viewer's local day, or an empty array if the session " +
           "id is unknown. Pass `tz_offset` (minutes, `Date.getTimezoneOffset()`) " +
@@ -393,6 +401,7 @@ module.exports = {
                 example: {
                   ...COST_RESULT_EXAMPLE,
                   total_cost: 8.4127,
+                  total_cost_exact: 8.41266,
                   daily_costs: [{ date: "2026-06-25", cost: 8.4127 }],
                 },
               },

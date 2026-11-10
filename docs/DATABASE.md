@@ -214,7 +214,7 @@ CREATE TABLE sessions (
 | `provider` | TEXT | NO | Product that produced the session: `claude` (default), `cursor`, or `codex`. Powers the composable `providers` API scope and lets shared token buckets use the correct rate card; selecting the Claude-compatible product scope includes both `claude` and `cursor`. |
 | `started_at` | TEXT | NO | ISO 8601 timestamp |
 | `ended_at` | TEXT | YES | ISO 8601 timestamp on terminal transition |
-| `metadata` | TEXT | YES | JSON blob for extras (turn duration totals, thinking blocks, …). Codex sessions also carry `provider`, `transcript_path`, `cli_version`, `model_provider`, and `git`; a Codex run that never wrote a rollout to disk (`codex exec --ephemeral`) additionally carries `hook_only: true`, which the UI uses to explain the absent transcript. That flag and the hook-reconstructed events tagged `data.source = "hook"` are both removed if a real rollout is later linked to the session |
+| `metadata` | TEXT | YES | JSON blob for extras (turn duration totals, thinking blocks, …). Claude sessions carry `version`, the Claude Code version of the first transcript entry that has one (live hook path, importer, and a one-time startup backfill; `null` when the transcript has none), which prices rules with an `intro_until_version` cutoff. Codex sessions also carry `provider`, `transcript_path`, `cli_version`, `model_provider`, and `git`; a Codex run that never wrote a rollout to disk (`codex exec --ephemeral`) additionally carries `hook_only: true`, which the UI uses to explain the absent transcript. That flag and the hook-reconstructed events tagged `data.source = "hook"` are both removed if a real rollout is later linked to the session |
 | `card_prompt_preview` | TEXT | YES | Newline-separated, bounded card-only context containing the two newest distinct human prompts. Claude Code derives it from the shared transcript cache during hooks, imports, and watchdog sweeps; Codex reads equivalent durable `codex_user_message` events when list/detail responses are built. It is not a transcript copy: full conversation content remains in JSONL, and historical rows fall back to their main-agent task. |
 | `updated_at` | TEXT | NO | Bumped on every event for staleness detection |
 | `awaiting_input_since` | TEXT | YES | ISO 8601 stamp set when the session is **Waiting** (Claude Stop, SessionStart with source `startup`/`resume`/`clear`, permission Notification, watchdog user-interrupt/Esc recovery, or Codex `task_complete` / `turn_aborted`). NULL otherwise. A Claude SessionStart with source `compact` (auto-compaction fires mid-turn while Claude is working) leaves this column untouched, so a genuinely-active session is not mislabeled Waiting |
@@ -418,6 +418,8 @@ CREATE TABLE model_pricing (
     cache_write_1h_per_mtok REAL NOT NULL DEFAULT 0,   -- 1h-ephemeral cache-write tier
     fast_input_per_mtok REAL NOT NULL DEFAULT 0,       -- fast-mode premium rates
     fast_output_per_mtok REAL NOT NULL DEFAULT 0,
+    long_input_per_mtok REAL NOT NULL DEFAULT 0,       -- long-prompt tier rates (0 = none)
+    long_output_per_mtok REAL NOT NULL DEFAULT 0,
     -- Time-limited introductory (promo) rates. When intro_until is set, usage on
     -- or before that date (YYYY-MM-DD) is priced at the intro_* rates and usage
     -- after it at the standard rates. All 0 / NULL = no promo.
@@ -427,6 +429,7 @@ CREATE TABLE model_pricing (
     intro_cache_write_per_mtok REAL NOT NULL DEFAULT 0,
     intro_cache_write_1h_per_mtok REAL NOT NULL DEFAULT 0,
     intro_until TEXT,                                   -- promo cutoff YYYY-MM-DD, or NULL
+    intro_until_version TEXT,                           -- Claude Code version cutoff, or NULL
     updated_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ','now'))
 );
 ```
@@ -440,8 +443,10 @@ CREATE TABLE model_pricing (
 | `input_per_mtok` / `output_per_mtok` | REAL | NO | Standard input / output rate per 1M tokens |
 | `cache_read_per_mtok` / `cache_write_per_mtok` / `cache_write_1h_per_mtok` | REAL | NO | Cache read + 5m/1h cache-write rates |
 | `fast_input_per_mtok` / `fast_output_per_mtok` | REAL | NO | Fast-mode premium rates (0 = no premium) |
+| `long_input_per_mtok` / `long_output_per_mtok` | REAL | NO | Rates for `token_usage` rows with `context_size = 'long'` (requests whose prompt exceeds the model's long-prompt limit); 0 = no long tier. Cache rates scale with the long input base |
 | `intro_*_per_mtok` | REAL | NO | Introductory (promo) rates, mirroring the standard fields |
 | `intro_until` | TEXT | YES | Promo cutoff `YYYY-MM-DD`. Usage on/before it uses the intro rates; NULL = no promo. Editable per-rule in Settings |
+| `intro_until_version` | TEXT | YES | Claude Code version cutoff for the intro rates (e.g. `2.1.295`). When the version that made the usage is known (`token_usage.cc_version`, else the session's `metadata.version`) it decides instead of `intro_until`; NULL = decide by date only. Seeded for Sonnet 5.5 (cache reads at $0.20 through Claude Code 2.1.295); set via `PUT /api/pricing` |
 | `updated_at` | TEXT | NO | ISO8601 timestamp of the last edit |
 
 Standard rates and intro rates are edited independently: the pricing update path writes intro columns only when the caller sends intro fields, so a standard-rate edit never disturbs a promo (and vice versa). Clearing `intro_until` also zeroes the intro rates.
