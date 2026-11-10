@@ -2,7 +2,7 @@
   "title": "设置",
   "subtitle": "管理定价、通知、数据和钩子",
   "exportData": "导出数据",
-  "acrossSessions": "跨所有追踪的会话",
+  "acrossSessions": "在所选数据范围内",
   "basedOnUsage": "基于每模型 Token 使用量",
   "tabby": {
     "title": "Tabby 伙伴",
@@ -139,6 +139,7 @@
     "title": "仪表盘数据",
     "description": "选择要在整个应用中显示哪个产品的会话、Token、费用和活动。更改会立即生效，并与机器数据源筛选保持独立。",
     "claude": "Claude Code",
+    "cursor": "Cursor",
     "codex": "Codex",
     "both": "两者",
     "claudeDescription": "显示 Claude Code 和 Cursor 数据。",
@@ -631,7 +632,8 @@
     "purgeData": "同时删除从此数据源导入的会话（无法撤销）",
     "deleteAndPurge": "移除 + 删除数据",
     "removeKeep": "移除（保留数据）",
-    "remoteSourceBadgeTitle": "从远程机器收集"
+    "remoteSourceBadgeTitle": "从远程机器收集",
+    "retryLastError": "正在重试。上次错误："
   },
   "cursorPathsNote": "Cursor 已包含在 Claude Code 仪表板范围内。本地历史会自动从 ~/.cursor 发现并创建快照；仅同步 Claude 的 SSH 导入不会同步远程 Cursor 文件夹。"
 }

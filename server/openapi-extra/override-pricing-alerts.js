@@ -97,6 +97,7 @@ const COST_RESULT_EXAMPLE = {
   },
   unpriced_models: [
     {
+      provider: "claude",
       model: "claude-experimental-preview",
       input_tokens: 4096,
       output_tokens: 2048,

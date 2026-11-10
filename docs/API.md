@@ -372,11 +372,16 @@ responses include human turns, legacy `function_call` records, and the primary
 can render the actual command flow rather than only `wait` calls. Both providers
 also expose persisted PNG/JPEG/GIF/WebP user attachments as `image` content blocks;
 missing or expired files are simply omitted, and Codex's duplicated response/event
-user records are returned as one human turn. Cursor main sessions can return
-`prompt_history.json` turns before JSONL exists. Their messages carry stable `id`
-values; an incremental result with `refresh: true` is a latest window that clients
-merge by `id`, allowing the canonical transcript to replace the pending prompt
-without duplication.
+user records are returned as one human turn. Cursor main sessions merge the
+ordered native `store.db` conversation, including tool calls/results and the
+concrete response model, with any replies available only in JSONL.
+`prompt_history.json` fills submitted prompts that neither durable source has
+recorded yet. JSONL and native `store.db` sources are snapshotted; prompt history is read from the
+live Cursor chat directory only. Messages carry stable `id` values, and an
+incremental result with `refresh: true` is a latest window that clients merge by
+`id`. A Cursor `/resume` shell ID is also accepted here and resolves to the
+canonical conversation before the transcript is read. The response does not
+include the canonical ID; the old ID remains accepted.
 
 #### Read Persisted Transcript Image
 
@@ -973,7 +978,7 @@ curl -X DELETE http://localhost:4820/api/pricing/gpt-5.1-codex
 
 ---
 
-#### Get Cost
+#### Calculate Cost
 
 ```http
 GET /api/pricing/cost
@@ -981,6 +986,9 @@ GET /api/pricing/cost/:sessionId
 ```
 
 Prices token usage against the pricing rules: every session, or one session. Both return `total_cost`, a per-bucket `breakdown` (each with `cost`), `cost_by_type`, `feature_costs`, `unpriced_models`, and `daily_costs`. Costs are rounded to 4 decimals. `total_cost_exact` and each breakdown entry's `cost_exact` carry the same figures unrounded, for exact comparison with Claude Code's own `cost-state` total (`scripts/compare-claude-cost.js` uses them).
+
+Each `unpriced_models` entry includes `provider` (`claude`, `cursor`, or `codex`) so a client can link
+the missing rate to the correct Settings editor; its tokens contribute $0 until a matching rule exists.
 
 ```bash
 curl http://localhost:4820/api/pricing/cost/<session-id>
@@ -1110,6 +1118,8 @@ The `/api/remote-sources/*` namespace configures **remote SSH machines** the das
 ```
 
 `ssh_port`, `identity_file`, `remote_home`, `remote_codex_home`, `claude_status`, `codex_status`, `last_error`, `last_sync_at`, and `last_sync_counts` are nullable. `remote_home` and `remote_codex_home` are the optional **Remote Claude home** and **Remote Codex home** overrides; send `null` on `PATCH` to return either provider to its default remote home. `status` is one of `idle`, `syncing`, `ok`, `error`; provider statuses additionally use `unavailable` when that CLI's history directory is absent.
+
+During `syncing`, `last_error` (and the WebSocket `error` field) retains the most recent failure, so automatic retries do not hide the diagnostic. A completed failure replaces it; a successful sync clears it. Last successful import counts and timestamp remain unchanged on failure.
 
 #### List Remote Sources
 
@@ -1454,7 +1464,7 @@ rows. Malformed JSON returns `400 INVALID_JSON`, an invalid bundle returns
 
 ### Agent Config
 
-The `/api/cc-config/*` namespace powers the Claude Config Explorer page. All read endpoints are pure file reads under `CLAUDE_HOME` and the project's `.claude/` dir; requested files and allowed roots are canonicalized with `realpath`, so a symlink cannot escape those roots. Mutations are limited to low-risk text-file artifacts (skills, subagents, slash commands, output styles, memory) and always create a timestamped backup before writing. Plugins, MCP servers, hooks-in-settings, and live `settings.json` files stay read-only because they are written concurrently by the running Claude Code CLI.
+The `/api/cc-config/*` namespace powers the Claude Config Explorer page. Claude home resolves as `CLAUDE_HOME || CLAUDE_CONFIG_DIR || ~/.claude`; the separate global state file is `$CLAUDE_CONFIG_DIR/.claude.json` when that variable is set, otherwise `~/.claude.json`. All read endpoints are pure file reads under the resolved Claude home and the project's `.claude/` dir; requested files and allowed roots are canonicalized with `realpath`, so a symlink cannot escape those roots. Mutations are limited to low-risk text-file artifacts (skills, subagents, slash commands, output styles, memory) and always create a timestamped backup before writing. Plugins, MCP servers, hooks-in-settings, and live `settings.json` files stay read-only because they are written concurrently by the running Claude Code CLI.
 
 ```http
 GET /api/cc-config/overview
@@ -2027,6 +2037,10 @@ await fetch('http://localhost:4820/api/pricing/my-custom-model', {
 ```
 
 ---
+
+## Remote Source Import Ownership
+
+Successful `POST /api/remote-sources/:id/sync` responses and successful entries in `POST /api/remote-sources/sync-all` include `sessions_excluded` (unique conflicting native IDs), `subagent_files_excluded`, and `excluded_ids` (at most 50 IDs), alongside the existing import counters. Successful provider-specific results carry the same counters; skipped, unavailable, and failed results report their status/reason or error instead. Sessions belonging to another source or provider are excluded from snapshots, events, tokens, and source tagging; a copied local session remains local and cannot be purged through the remote source. Ownership is checked again when writing after asynchronous transcript or workflow parsing. The local periodic Claude sweep also rechecks after its synchronous import before snapshotting or publishing a change. Failed Claude session transactions do not publish snapshots or workflow journals. Codex imports reject conflicting filename, metadata or cursor identities before ingesting; metadata-free legacy transcripts retain their filename identity fallback. Local Claude directory imports also exclude other providers before publishing snapshots or workflows. New remote rows record source and `metadata.origin_host` atomically. The `collector-v2` origin mark hashes the configured SSH destination, port, identity-file path and both provider history roots. After source deletion without purge, only an exact mark permits re-adoption. Legacy host-only marks are retained but do not authorize re-adoption; an existing registered owner can refresh its mark during a normal import. Cached rows with missing or empty metadata receive an object containing the mark during tagging. Nonempty malformed or nonobject metadata is preserved and cannot authorize local history imports. The sessions metadata PATCH replaces metadata; explicit replacement can remove a provenance mark, so this guarantee applies to normal import and source deletion flows. Destination case and an unspecified port are preserved because SSH usernames are case-sensitive and SSH configuration can supply a port. This identifies the configured collector, not key contents, resolved SSH configuration or the machine where a copied session originally ran. Existing timer and SSH transport behavior are unchanged.
 
 ## Summary
 
